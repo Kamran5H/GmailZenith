@@ -27,7 +27,10 @@ Thumbs.db
 # Runtime & output files
 *.log
 token.pickle
+token.json
 credentials.json
+client_secret*.json
+*.env
 test-results/
 playwright-report/
 temp/

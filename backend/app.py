@@ -44,6 +44,8 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "http://127.0.0.1:8767",
+        "http://localhost:8767",
         "http://127.0.0.1:8765",
         "http://localhost:8765",
     ],
@@ -312,12 +314,12 @@ def get_sync_config():
         "purge_promotions": True,
         "purge_social": True,
         "purge_spam": True,
-        # Example rules — edit these in the app to match your own inbox.
         "custom_rules": [
-            {"name": "Newsletters & Digests", "query": "(newsletter OR digest) in:inbox", "enabled": True},
-            {"name": "Social Notifications", "query": "category:social in:inbox", "enabled": True},
-            {"name": "Promotions", "query": "category:promotions in:inbox", "enabled": True},
-            {"name": "Receipts & Bookings", "query": "(receipt OR booking OR ticket) in:inbox", "enabled": False},
+            {"name": "Quora & Digests", "query": "(quora OR quoradigest) in:inbox", "enabled": True},
+            {"name": "OctaFX Trading", "query": "octafx in:inbox", "enabled": True},
+            {"name": "Askari Bank Alerts", "query": "(askari OR askaribank) in:inbox", "enabled": True},
+            {"name": "Snapchat Alerts", "query": "(snapchat OR from:snapchat.com) in:inbox", "enabled": True},
+            {"name": "Commercial Booking/Tickets", "query": "(from:bookmepk.com OR from:faisalmovers.com) in:inbox", "enabled": True},
         ]
     }
 
@@ -397,7 +399,7 @@ def open_in_browser(url: str):
         pass
 
 
-def is_port_in_use(port: int = 8765, host: str = "127.0.0.1") -> bool:
+def is_port_in_use(port: int = 8767, host: str = "127.0.0.1") -> bool:
     """Checks if server is already running."""
     import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -405,7 +407,7 @@ def is_port_in_use(port: int = 8765, host: str = "127.0.0.1") -> bool:
         return s.connect_ex((host, port)) == 0
 
 
-def start_server(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True):
+def start_server(host: str = "127.0.0.1", port: int = 8767, open_browser: bool = True):
     """Starts the uvicorn server or opens browser if already running."""
     url = f"http://{host}:{port}"
     if is_port_in_use(port=port, host=host):

@@ -242,7 +242,7 @@ class GmailZenithApp {
       }
     } catch (e) {
       this.statusTitle.textContent = 'Backend Offline';
-      this.statusEmail.textContent = 'Checking localhost:8765...';
+      this.statusEmail.textContent = 'Checking localhost:8767...';
       this.log(`Failed to connect to backend: ${e}`, 'danger');
     }
   }
