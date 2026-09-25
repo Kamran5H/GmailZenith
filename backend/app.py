@@ -1,434 +1,365 @@
 """
-Gmail Zenith Pro - FastAPI Backend Server
-High-performance REST API supporting real-time inbox analytics, batch cleanups,
-smart query filtering, and GitHub notification triage.
+Gmail Zenith - FastAPI server.
+
+Serves the dashboard and a small local REST API over the Gmail engine.
+Run with:  python backend/app.py   (opens http://127.0.0.1:8767)
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
+import html
 import os
 from pathlib import Path
+import socket
+import subprocess
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional
 import webbrowser
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from google.auth.exceptions import RefreshError
+from googleapiclient.errors import HttpError
+from pydantic import BaseModel, Field
 import uvicorn
 
-# Ensure backend folder is on path
 BASE_DIR = Path(__file__).resolve().parent.parent
-BACKEND_DIR = BASE_DIR / "backend"
 FRONTEND_DIR = BASE_DIR / "frontend"
+if str(BASE_DIR / "backend") not in sys.path:
+    sys.path.insert(0, str(BASE_DIR / "backend"))
 
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
-
-from gmail_engine import CREDENTIALS_PATH, TOKEN_PATH, engine
-
-app = FastAPI(
-    title="Gmail Zenith Pro",
-    description="4K HD AI-Powered Inbox Optimizer & Triage Suite for Kamran Ashraf",
-    version="1.0.0",
+import auto_sync  # noqa: E402
+from gmail_engine import (  # noqa: E402
+    CREDENTIALS_PATH, PRESETS, TOKEN_PATH, USER_ACTIONS, NotAuthenticated, engine,
 )
 
-# This server controls destructive Gmail operations (trash/permanent-delete). It is
-# bound to localhost, so restrict CORS to local origins — a wide-open "*" would let
-# any website you visit issue delete commands to this API from your browser.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:8767",
-        "http://localhost:8767",
-        "http://127.0.0.1:8765",
-        "http://localhost:8765",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+VERSION = "2.0.0"
+HOST = os.environ.get("ZENITH_HOST", "127.0.0.1")
+PORT = int(os.environ.get("ZENITH_PORT", "8767"))
+
+app = FastAPI(title="Gmail Zenith", description="Local Gmail inbox cleanup API", version=VERSION)
 
 
-# --- Request Models ---
-class SimulateCleanRequest(BaseModel):
-    query: str
-    max_scan: int = 50
+# --------------------------------------------------------------- security
+@app.middleware("http")
+async def same_origin_only(request: Request, call_next):
+    """This API can trash mail, so reject state-changing requests from other websites.
+    Browsers always send Origin on cross-site POSTs; local tools (curl, scripts) send none."""
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin = request.headers.get("origin")
+        if origin and origin.rstrip("/") != str(request.base_url).rstrip("/"):
+            return JSONResponse({"detail": "Cross-origin request blocked."}, status_code=403)
+    return await call_next(request)
 
 
-class PresetCleanRequest(BaseModel):
-    preset: str
-    max_items: int = 100
+@app.exception_handler(NotAuthenticated)
+async def _not_auth(_: Request, exc: NotAuthenticated):
+    return JSONResponse({"detail": str(exc)}, status_code=401)
 
 
-class BatchTrashRequest(BaseModel):
-    message_ids: List[str]
+@app.exception_handler(RefreshError)
+async def _refresh_failed(_: Request, exc: RefreshError):
+    engine.load_credentials()
+    return JSONResponse({"detail": "Google rejected the saved sign-in. Please reconnect on the Setup tab."},
+                        status_code=401)
 
 
-class BatchLabelsRequest(BaseModel):
-    message_ids: List[str]
-    add_labels: Optional[List[str]] = None
-    remove_labels: Optional[List[str]] = None
+@app.exception_handler(HttpError)
+async def _gmail_error(_: Request, exc: HttpError):
+    reason = exc._get_reason() if hasattr(exc, "_get_reason") else str(exc)
+    return JSONResponse({"detail": f"Gmail API error: {reason}"}, status_code=502)
 
 
-class CredentialsUploadJson(BaseModel):
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    raw_json: Optional[Dict[str, Any]] = None
+@app.exception_handler(ValueError)
+async def _bad_value(_: Request, exc: ValueError):
+    return JSONResponse({"detail": str(exc)}, status_code=400)
 
 
-# --- API Routes ---
+# ----------------------------------------------------------------- models
+class IdsRequest(BaseModel):
+    message_ids: List[str] = Field(..., max_length=5000)
+    action: str
 
+
+class UndoOp(BaseModel):
+    action: str
+    ids: List[str] = Field(..., max_length=5000)
+
+
+class UndoRequest(BaseModel):
+    ops: List[UndoOp] = Field(..., max_length=10)
+
+
+class QueryRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=2000)
+    action: str = "trash"
+    limit: int = Field(5000, ge=1, le=5000)
+    protect_starred: bool = True
+
+
+class PreviewRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=2000)
+    protect_starred: bool = True
+
+
+class UnsubscribeRequest(BaseModel):
+    message_id: str
+
+
+def _redirect_uri(request: Request) -> str:
+    return str(request.base_url).rstrip("/") + "/oauth2callback"
+
+
+# ------------------------------------------------------------------- auth
 @app.get("/api/health")
 def api_health():
-    return {"status": "ok", "app": "Gmail Zenith Pro", "version": "1.0.0"}
+    return {"status": "ok", "app": "Gmail Zenith", "version": VERSION}
 
 
 @app.get("/api/auth/status")
-def get_auth_status():
-    has_credentials = CREDENTIALS_PATH.exists()
-    has_token = TOKEN_PATH.exists()
-    is_auth = engine.is_authenticated()
-    profile = engine.get_profile() if is_auth else None
-
+def get_auth_status(request: Request):
+    authenticated = engine.is_authenticated()
+    profile = None
+    if authenticated:
+        try:
+            profile = engine.get_profile()
+        except Exception:
+            authenticated = False
     return {
-        "authenticated": is_auth,
-        "hasCredentials": has_credentials,
-        "hasToken": has_token,
+        "authenticated": authenticated,
+        "hasCredentials": CREDENTIALS_PATH.exists(),
+        "hasToken": TOKEN_PATH.exists(),
+        "clientType": engine.client_type(),
+        "redirectUri": _redirect_uri(request),
         "profile": profile,
     }
 
 
 @app.post("/api/auth/upload-credentials")
 async def upload_credentials(file: UploadFile = File(...)):
+    content = await file.read()
+    if len(content) > 100_000:
+        raise HTTPException(400, "File is too large to be an OAuth client JSON.")
     try:
-        content = await file.read()
-        saved = engine.save_credentials_file(content)
-        if saved:
-            return {"success": True, "message": "credentials.json saved successfully."}
-        else:
-            raise HTTPException(status_code=400, detail="Invalid JSON file format.")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        engine.save_credentials_file(content)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception:
+        raise HTTPException(400, "Could not read the file. Make sure it is the JSON you downloaded from Google.")
+    return {"success": True, "message": "credentials.json saved."}
 
 
 @app.post("/api/auth/save-credentials-json")
 def save_credentials_json(payload: Dict[str, Any]):
-    saved = engine.save_credentials_file(payload)
-    if saved:
-        return {"success": True, "message": "credentials.json saved successfully."}
-    raise HTTPException(status_code=400, detail="Failed to parse credentials JSON.")
+    engine.save_credentials_file(payload)
+    return {"success": True, "message": "credentials.json saved."}
 
 
 @app.get("/api/auth/url")
-def get_auth_url(redirect_uri: str = "http://127.0.0.1:8765/oauth2callback"):
+def get_auth_url(request: Request):
     try:
-        url = engine.get_authorization_url(redirect_uri=redirect_uri)
-        return {"success": True, "auth_url": url}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return {"success": True, "auth_url": engine.get_authorization_url(_redirect_uri(request))}
+    except FileNotFoundError as e:
+        raise HTTPException(400, str(e))
+
+
+def _result_page(ok: bool, title: str, message: str) -> str:
+    color = "#34d399" if ok else "#f87171"
+    icon = "&#10004;" if ok else "&#10006;"
+    script = """
+      if (window.opener) { try { window.opener.postMessage('oauth_complete', window.location.origin); } catch (e) {}
+        setTimeout(() => window.close(), 1200); }
+      else { setTimeout(() => window.location.href = '/', 1800); }""" if ok else ""
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{html.escape(title)} — Gmail Zenith</title>
+<style>body{{font-family:system-ui,-apple-system,sans-serif;background:#070913;color:#f8fafc;display:grid;place-items:center;min-height:100vh;margin:0;padding:20px}}
+.card{{background:#12182c;border:1px solid rgba(255,255,255,.1);border-radius:16px;max-width:460px;padding:36px 28px;text-align:center}}
+.i{{font-size:30px;color:{color};margin-bottom:10px}}p{{color:#94a3b8;line-height:1.5}}a{{color:#60a5fa}}</style>
+<script>{script}</script></head><body><div class="card"><div class="i">{icon}</div><h2>{html.escape(title)}</h2>
+<p>{html.escape(message)}</p><p><a href="/">Back to Gmail Zenith</a></p></div></body></html>"""
 
 
 @app.get("/oauth2callback", response_class=HTMLResponse)
-def oauth2callback(code: Optional[str] = None, error: Optional[str] = None):
+def oauth2callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
     if error:
-        return f"""
-        <!DOCTYPE html>
-        <html><head><title>Auth Error</title>
-        <style>body{{font-family:sans-serif;background:#0f1220;color:#f87171;text-align:center;padding:50px;}}</style>
-        </head><body>
-        <h2>Authentication Failed</h2><p>{error}</p>
-        <p><a href="/" style="color:#60a5fa;">Return to Gmail Zenith Pro</a></p>
-        </body></html>
-        """
-    if not code:
-        raise HTTPException(status_code=400, detail="Missing authorization code.")
-
-    res = engine.exchange_code_for_token(code=code, redirect_uri="http://127.0.0.1:8765/oauth2callback")
-    if res.get("success"):
-        email_addr = res.get("profile", {}).get("email", "Your Account")
-        return f"""
-        <!DOCTYPE html>
-        <html><head><title>Connected — Gmail Zenith Pro</title>
-        <meta charset="utf-8">
-        <style>
-          body {{ font-family: -apple-system, system-ui, sans-serif; background: #070913; color: #f8fafc; text-align: center; padding: 60px 20px; }}
-          .card {{ background: rgba(18,24,44,0.85); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; max-width: 480px; margin: 0 auto; padding: 36px 24px; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }}
-          .badge {{ display: inline-block; width: 60px; height: 60px; line-height: 60px; border-radius: 50%; background: rgba(16,185,129,0.15); color: #34d399; font-size: 32px; margin-bottom: 16px; }}
-          h2 {{ margin: 0 0 8px; color: #f8fafc; font-size: 24px; }}
-          p {{ color: #94a3b8; font-size: 15px; line-height: 1.5; }}
-          .btn {{ display: inline-block; margin-top: 20px; background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 10px; font-weight: bold; }}
-        </style>
-        <script>
-          if (window.opener) {{
-            try {{ window.opener.postMessage('oauth_complete', '*'); }} catch(e) {{}}
-            setTimeout(() => window.close(), 1500);
-          }} else {{
-            setTimeout(() => window.location.href = '/', 2000);
-          }}
-        </script>
-        </head><body>
-        <div class="card">
-          <div class="badge">&#10004;</div>
-          <h2>Connected Successfully!</h2>
-          <p>Gmail Zenith Pro is now connected to <b>{email_addr}</b>.</p>
-          <p style="font-size:13px; color:#64748b;">This window will close automatically...</p>
-          <a class="btn" href="/">Return to Dashboard</a>
-        </div>
-        </body></html>
-        """
-    else:
-        return f"""
-        <!DOCTYPE html>
-        <html><head><title>Auth Error</title>
-        <style>body{{font-family:sans-serif;background:#0f1220;color:#f87171;text-align:center;padding:50px;}}</style>
-        </head><body>
-        <h2>Authentication Failed</h2><p>{res.get('error')}</p>
-        <p><a href="/" style="color:#60a5fa;">Return to Gmail Zenith Pro</a></p>
-        </body></html>
-        """
-
-
-@app.post("/api/auth/exchange-code")
-def exchange_code(payload: Dict[str, str]):
-    code = payload.get("code")
-    if not code:
-        raise HTTPException(status_code=400, detail="Code is required.")
-    res = engine.exchange_code_for_token(code=code, redirect_uri=payload.get("redirect_uri", "http://127.0.0.1:8765/oauth2callback"))
-    return res
-
-
-@app.post("/api/auth/interactive-login")
-def interactive_login():
-    res = engine.authenticate_interactive()
-    return res
+        return HTMLResponse(_result_page(False, "Sign-in cancelled", f"Google returned: {error}"), status_code=400)
+    if not code or not state:
+        return HTMLResponse(_result_page(False, "Sign-in failed", "Missing authorization code."), status_code=400)
+    try:
+        profile = engine.exchange_code_for_token(code=code, state=state)
+    except Exception as e:
+        return HTMLResponse(_result_page(False, "Sign-in failed", str(e)), status_code=400)
+    return _result_page(True, "Connected", f"Gmail Zenith is connected to {profile.get('email', 'your account')}.")
 
 
 @app.post("/api/auth/logout")
 def logout():
-    success = engine.logout()
-    return {"success": success}
+    engine.logout()
+    return {"success": True}
 
 
+# ------------------------------------------------------------------ stats
 @app.get("/api/stats/inbox")
 def get_inbox_stats():
-    if not engine.is_authenticated():
-        raise HTTPException(status_code=401, detail="Gmail is not authenticated.")
     return engine.get_inbox_stats()
 
 
 @app.get("/api/stats/top-senders")
-def get_top_senders(limit: int = Query(100, ge=10, le=200)):
-    if not engine.is_authenticated():
-        raise HTTPException(status_code=401, detail="Gmail is not authenticated.")
-    return {"senders": engine.get_top_clutter_senders(scan_limit=limit)}
+def get_top_senders(limit: int = Query(300, ge=50, le=1000)):
+    return engine.get_top_senders(scan_limit=limit)
 
 
+@app.get("/api/presets")
+def get_presets(counts: bool = False):
+    data = {k: dict(v, key=k) for k, v in PRESETS.items()}
+    if counts:
+        for k, c in engine.preset_counts().items():
+            data[k].update(c)
+    return {"presets": list(data.values())}
+
+
+# ----------------------------------------------------------------- search
 @app.get("/api/search")
 def search_emails(
-    q: str = Query(..., description="Gmail search query"),
+    q: str = Query(..., min_length=1, max_length=2000),
     max_results: int = Query(50, ge=1, le=200),
-    page_token: Optional[str] = Query(None),
-    include_spam_trash: bool = Query(False),
+    page_token: Optional[str] = None,
 ):
-    if not engine.is_authenticated():
-        raise HTTPException(status_code=401, detail="Gmail is not authenticated.")
-    return engine.search_messages(
-        query=q,
-        max_results=max_results,
-        page_token=page_token,
-        include_spam_trash=include_spam_trash,
-    )
+    return engine.search_messages(query=q, max_results=max_results, page_token=page_token)
 
 
 @app.get("/api/github/triage")
-def get_github_triage(max_results: int = Query(50, ge=1, le=100)):
-    if not engine.is_authenticated():
-        raise HTTPException(status_code=401, detail="Gmail is not authenticated.")
+def get_github_triage(max_results: int = Query(100, ge=1, le=200)):
     return engine.get_github_triage(max_results=max_results)
 
 
-@app.post("/api/clean/simulate")
-def simulate_clean(req: SimulateCleanRequest):
-    if not engine.is_authenticated():
-        raise HTTPException(status_code=401, detail="Gmail is not authenticated.")
-    return engine.simulate_clean(query=req.query, max_scan=req.max_scan)
+# ---------------------------------------------------------------- actions
+@app.post("/api/actions/preview")
+def preview(req: PreviewRequest):
+    return engine.preview(req.query, protect_starred=req.protect_starred)
 
 
-@app.post("/api/clean/preset")
-def clean_by_preset(req: PresetCleanRequest):
-    if not engine.is_authenticated():
-        raise HTTPException(status_code=401, detail="Gmail is not authenticated.")
-    return engine.clean_by_preset(preset_name=req.preset, max_items=req.max_items)
+@app.post("/api/actions/query")
+def action_on_query(req: QueryRequest):
+    return engine.apply_action_to_query(req.query, req.action, limit=req.limit, protect_starred=req.protect_starred)
 
 
-@app.post("/api/batch/trash")
-def batch_trash(req: BatchTrashRequest):
-    if not engine.is_authenticated():
-        raise HTTPException(status_code=401, detail="Gmail is not authenticated.")
-    return engine.batch_trash_messages(req.message_ids)
+@app.post("/api/actions/ids")
+def action_on_ids(req: IdsRequest):
+    return engine.apply_action(req.message_ids, req.action)
 
 
-@app.post("/api/batch/untrash")
-def batch_untrash(req: BatchTrashRequest):
-    if not engine.is_authenticated():
-        raise HTTPException(status_code=401, detail="Gmail is not authenticated.")
-    return engine.batch_untrash_messages(req.message_ids)
+@app.post("/api/actions/undo")
+def undo(req: UndoRequest):
+    return engine.run_ops([op.model_dump() for op in req.ops])
 
 
-@app.post("/api/batch/delete")
-def batch_delete(req: BatchTrashRequest):
-    if not engine.is_authenticated():
-        raise HTTPException(status_code=401, detail="Gmail is not authenticated.")
-    return engine.batch_delete_messages(req.message_ids)
+@app.get("/api/actions")
+def list_actions():
+    return {"actions": list(USER_ACTIONS)}
 
 
-@app.post("/api/batch/labels")
-def batch_modify_labels(req: BatchLabelsRequest):
-    if not engine.is_authenticated():
-        raise HTTPException(status_code=401, detail="Gmail is not authenticated.")
-    return engine.batch_modify_labels(
-        message_ids=req.message_ids,
-        add_labels=req.add_labels,
-        remove_labels=req.remove_labels,
-    )
+@app.post("/api/unsubscribe")
+def unsubscribe(req: UnsubscribeRequest):
+    return engine.unsubscribe(req.message_id)
 
 
+# -------------------------------------------------------------- auto-clean
 @app.get("/api/sync/config")
 def get_sync_config():
-    config_file = BASE_DIR / "auto_sync_config.json"
-    if config_file.exists():
-        try:
-            with open(config_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
-        "enabled": True,
-        "interval_minutes": 15,
-        "purge_promotions": True,
-        "purge_social": True,
-        "purge_spam": True,
-        "custom_rules": [
-            {"name": "Quora & Digests", "query": "(quora OR quoradigest) in:inbox", "enabled": True},
-            {"name": "OctaFX Trading", "query": "octafx in:inbox", "enabled": True},
-            {"name": "Askari Bank Alerts", "query": "(askari OR askaribank) in:inbox", "enabled": True},
-            {"name": "Snapchat Alerts", "query": "(snapchat OR from:snapchat.com) in:inbox", "enabled": True},
-            {"name": "Commercial Booking/Tickets", "query": "(from:bookmepk.com OR from:faisalmovers.com) in:inbox", "enabled": True},
-        ]
-    }
+    return auto_sync.load_config()
 
 
 @app.post("/api/sync/config")
 def update_sync_config(cfg: Dict[str, Any]):
-    config_file = BASE_DIR / "auto_sync_config.json"
-    try:
-        with open(config_file, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-        return {"success": True, "config": cfg}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"success": True, "config": auto_sync.save_config(cfg)}
 
 
 @app.get("/api/sync/history")
 def get_sync_history():
-    log_file = BASE_DIR / "auto_sync_log.json"
-    if log_file.exists():
-        try:
-            with open(log_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
+    return list(reversed(auto_sync.load_history()))
+
+
+@app.get("/api/sync/status")
+def get_sync_status():
+    return auto_sync.status()
 
 
 @app.post("/api/sync/run-now")
-def trigger_sync_now(background_tasks: BackgroundTasks):
-    try:
-        import subprocess
-        subprocess.Popen([sys.executable, str(BASE_DIR / "auto_process_inbox.py")], cwd=str(BASE_DIR))
-        return {"success": True, "message": "Automated sync cycle triggered in background"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def trigger_sync_now():
+    if not engine.is_authenticated():
+        raise NotAuthenticated("Gmail is not connected.")
+    if auto_sync.status()["running"]:
+        raise HTTPException(409, "An auto-clean run is already in progress.")
+
+    def _run():
+        try:
+            auto_sync.run_rules(engine)
+        except Exception as e:
+            print(f"[AutoSync] Run failed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"success": True, "message": "Auto-clean started."}
 
 
-# --- Static Frontend Mounting ---
+# --------------------------------------------------------------- frontend
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)
 def index_page():
-    index_file = FRONTEND_DIR / "index.html"
-    if index_file.exists():
-        with open(index_file, "r", encoding="utf-8") as f:
-            return f.read()
-    return "<h1>Gmail Zenith Pro: Frontend is building...</h1>"
+    return FileResponse(FRONTEND_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
-def open_in_browser(url: str):
-    """Launches Google Chrome or Microsoft Edge or default browser in app mode."""
-    import subprocess
-    browser_candidates = [
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return FileResponse(BASE_DIR / "gmail_zenith.ico")
+
+
+# ---------------------------------------------------------------- launcher
+def open_in_browser(url: str) -> None:
+    """Opens the dashboard as a chromeless app window when Chrome/Edge is available."""
+    candidates = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     ]
-    for exe in browser_candidates:
+    for exe in candidates:
         if os.path.exists(exe):
             try:
                 subprocess.Popen([exe, f"--app={url}"])
                 return
-            except Exception:
-                try:
-                    subprocess.Popen([exe, url])
-                    return
-                except Exception:
-                    pass
-    # Fallback to webbrowser module
-    try:
-        import webbrowser
-        webbrowser.open(url)
-    except Exception:
-        pass
+            except OSError:
+                pass
+    webbrowser.open(url)
 
 
-def is_port_in_use(port: int = 8767, host: str = "127.0.0.1") -> bool:
-    """Checks if server is already running."""
-    import socket
+def is_port_in_use(port: int = PORT, host: str = HOST) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
         return s.connect_ex((host, port)) == 0
 
 
-def start_server(host: str = "127.0.0.1", port: int = 8767, open_browser: bool = True):
-    """Starts the uvicorn server or opens browser if already running."""
+def start_server(host: str = HOST, port: int = PORT, open_browser: bool = True) -> None:
     url = f"http://{host}:{port}"
     if is_port_in_use(port=port, host=host):
-        print(f"[INFO] Server is already running on {url}. Opening browser...")
-        open_in_browser(url)
-        sys.exit(0)
+        print(f"[INFO] Gmail Zenith is already running at {url}")
+        if open_browser:
+            open_in_browser(url)
+        return
 
     if open_browser:
-        def _open():
-            time.sleep(0.8)
-            open_in_browser(url)
-        import threading
-        threading.Thread(target=_open, daemon=True).start()
+        threading.Thread(target=lambda: (time.sleep(1.0), open_in_browser(url)), daemon=True).start()
 
-    print(f"=======================================================")
-    print(f"[START] GMAIL ZENITH PRO - AI INBOX OPTIMIZER & TRIAGE")
-    print(f"[HTTP]  Web UI running at: {url}")
-    print(f"=======================================================\n")
-
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    print("=" * 50)
+    print(f"  Gmail Zenith {VERSION}  ->  {url}")
+    print("=" * 50)
+    uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":
-    start_server(open_browser=True)
+    start_server(open_browser="--no-browser" not in sys.argv)

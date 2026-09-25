@@ -1,74 +1,59 @@
-' Gmail Zenith Pro - Instant Native App Launcher
-' Kamran Ashraf (Kami) AI Suite
+' Gmail Zenith - silent launcher (double-click, or use the desktop shortcut).
+' Starts the server in the background if needed, then opens the dashboard window.
 Option Explicit
-Dim WshShell, FSO, CurrentDirectory, PythonExe, AppScript, CommandLine
-Dim BrowserExe, TargetUrl, candidates, cand, i
+Dim sh, fso, appDir, py, url, i
 
-Set WshShell = CreateObject("WScript.Shell")
-Set FSO = CreateObject("Scripting.FileSystemObject")
+Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+appDir = fso.GetParentFolderName(WScript.ScriptFullName)
+sh.CurrentDirectory = appDir
+url = "http://127.0.0.1:8767"
 
-CurrentDirectory = FSO.GetParentFolderName(WScript.ScriptFullName)
-If Not FSO.FileExists(CurrentDirectory & "\backend\app.py") Then
-    candidates = Array( _
-        "C:\Users\chkam\OneDrive\Desktop\BrandFinder\GmailZenith", _
-        "C:\Users\chkam\OneDrive\Desktop\GmailZenith", _
-        "C:\Users\chkam\Desktop\BrandFinder\GmailZenith" _
-    )
-    For Each cand In candidates
-        If FSO.FileExists(cand & "\backend\app.py") Then
-            CurrentDirectory = cand
-            Exit For
-        End If
+' Prefer a local virtual environment, then pythonw on PATH.
+If fso.FileExists(appDir & "\.venv\Scripts\pythonw.exe") Then
+    py = appDir & "\.venv\Scripts\pythonw.exe"
+Else
+    py = "pythonw"
+End If
+
+If Not ServerUp() Then
+    sh.Run Chr(34) & py & Chr(34) & " " & Chr(34) & appDir & "\backend\app.py" & Chr(34) & " --no-browser", 0, False
+    For i = 1 To 60
+        If ServerUp() Then Exit For
+        WScript.Sleep 500
     Next
 End If
 
-WshShell.CurrentDirectory = CurrentDirectory
-TargetUrl = "http://127.0.0.1:8767"
-
-PythonExe = "C:\Users\chkam\AppData\Local\Programs\Python\Python314\python.exe"
-If Not FSO.FileExists(PythonExe) Then
-    PythonExe = "python"
-End If
-
-AppScript = CurrentDirectory & "\backend\app.py"
-CommandLine = "cmd /c " & Chr(34) & Chr(34) & PythonExe & Chr(34) & " " & Chr(34) & AppScript & Chr(34) & " > " & Chr(34) & CurrentDirectory & "\launch.log" & Chr(34) & " 2>&1" & Chr(34)
-
 If Not ServerUp() Then
-    On Error Resume Next
-    WshShell.Run CommandLine, 0, False
-    On Error GoTo 0
+    MsgBox "Gmail Zenith could not start. Run run_gmail_zenith.bat to see the error.", 48, "Gmail Zenith"
+    WScript.Quit 1
 End If
 
-BrowserExe = ""
-If FSO.FileExists("C:\Program Files\Google\Chrome\Application\chrome.exe") Then
-    BrowserExe = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-ElseIf FSO.FileExists("C:\Program Files (x86)\Google\Chrome\Application\chrome.exe") Then
-    BrowserExe = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-ElseIf FSO.FileExists("C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe") Then
-    BrowserExe = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-ElseIf FSO.FileExists("C:\Program Files\Microsoft\Edge\Application\msedge.exe") Then
-    BrowserExe = "C:\Program Files\Microsoft\Edge\Application\msedge.exe"
-End If
-
-For i = 1 To 60
-    If ServerUp() Then Exit For
-    WScript.Sleep 500
+' Open as an app window in Chrome/Edge if available, else the default browser.
+Dim candidates, c
+candidates = Array( _
+    "C:\Program Files\Google\Chrome\Application\chrome.exe", _
+    "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", _
+    "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", _
+    "C:\Program Files\Microsoft\Edge\Application\msedge.exe")
+For Each c In candidates
+    If fso.FileExists(c) Then
+        sh.Run Chr(34) & c & Chr(34) & " --app=" & url, 1, False
+        WScript.Quit 0
+    End If
 Next
-
-If BrowserExe <> "" Then
-    WshShell.Run Chr(34) & BrowserExe & Chr(34) & " --app=" & TargetUrl, 1, False
-Else
-    WshShell.Run "cmd.exe /c start " & TargetUrl, 0, False
-End If
+sh.Run url, 1, False
 
 Function ServerUp()
     Dim h
     ServerUp = False
     On Error Resume Next
     Set h = CreateObject("MSXML2.ServerXMLHTTP.6.0")
-    h.setTimeouts 1500, 1500, 1500, 1500
-    h.Open "GET", TargetUrl & "/", False
+    h.setTimeouts 1000, 1000, 1000, 1000
+    h.Open "GET", url & "/api/health", False
     h.Send
-    If Err.Number = 0 And h.Status = 200 Then ServerUp = True
+    If Err.Number = 0 Then
+        If h.Status = 200 Then ServerUp = True
+    End If
     On Error GoTo 0
 End Function

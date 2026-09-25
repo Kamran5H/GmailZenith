@@ -35,3 +35,9 @@ test-results/
 playwright-report/
 temp/
 output/
+
+# Gmail Zenith local state (personal data - never commit)
+auto_sync_config.json
+auto_sync_log.json
+launch.log
+.pytest_cache/

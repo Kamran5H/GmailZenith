@@ -1,8 +1,12 @@
 """
-Generate a sleek, glowing 4K HD application icon for Gmail Zenith Pro.
+Regenerates gmail_zenith.ico (requires Pillow: pip install pillow).
 """
 
+from pathlib import Path
+
 from PIL import Image, ImageDraw
+
+ICON_PATH = Path(__file__).resolve().parent / "gmail_zenith.ico"
 
 def create_icon():
     size = (256, 256)
@@ -30,9 +34,8 @@ def create_icon():
     draw.ellipse([155, 140, 215, 200], fill=(16, 185, 129, 255), outline=(255, 255, 255, 255), width=3)
     draw.line([(170, 170), (182, 182), (202, 158)], fill=(255, 255, 255, 255), width=5)
 
-    ico_path = "c:/Users/chkam/OneDrive/Desktop/BrandFinder/GmailZenith/gmail_zenith.ico"
-    img.save(ico_path, format="ICO", sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
-    print(f"Saved icon to {ico_path}")
+    img.save(ICON_PATH, format="ICO", sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
+    print(f"Saved icon to {ICON_PATH}")
 
 if __name__ == "__main__":
     create_icon()

@@ -1,31 +1,27 @@
 """
-Deep scan and analysis of user's inbox
+Prints the most recent inbox messages to the terminal.
+Usage: python scan_primary_inbox.py [count] [query]
 """
-import sys
+
 from pathlib import Path
+import sys
 
-BASE_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(BASE_DIR))
-sys.path.insert(0, str(BASE_DIR / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "backend"))
 
-from gmail_engine import engine
+from gmail_engine import engine  # noqa: E402
 
-def scan():
+
+def scan(count: int = 50, query: str = "in:inbox") -> None:
     if not engine.is_authenticated():
-        print("[ERROR] Not authenticated.")
-        return
-
-    res = engine.search_messages(query="in:inbox", max_results=100)
-    messages = res.get("messages", [])
-    print(f"Retrieved {len(messages)} messages from Inbox:\n")
-
+        sys.exit("[ERROR] Not signed in. Start the dashboard (python backend/app.py) and connect Gmail first.")
+    messages = engine.search_messages(query=query, max_results=count)["messages"]
+    print(f"{len(messages)} message(s) for '{query}':\n")
     for idx, m in enumerate(messages, 1):
-        s_name = m.get("senderName", "")
-        s_email = m.get("senderEmail", "")
-        subj = m.get("subject", "")
-        date = m.get("date", "")
-        labels = m.get("labelIds", [])
-        print(f"[{idx:02d}] {s_name} <{s_email}> | Subj: {subj} | Date: {date} | Labels: {labels}")
+        flag = "*" if m["unread"] else " "
+        print(f"{flag}[{idx:03d}] {m['senderName'][:28]:<28} | {m['subject'][:70]}")
+
 
 if __name__ == "__main__":
-    scan()
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 50
+    q = " ".join(sys.argv[2:]) or "in:inbox"
+    scan(n, q)
