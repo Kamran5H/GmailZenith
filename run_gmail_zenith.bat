@@ -1,19 +1,20 @@
 @echo off
-title Gmail Zenith Pro - AI Inbox Optimizer ^& Triage
+title Gmail Zenith
 cd /d "%~dp0"
 
-echo =======================================================
-echo   GMAIL ZENITH PRO - AI INBOX OPTIMIZER & TRIAGE
-echo   Kamran Ashraf AI Suite
-echo =======================================================
-echo.
+set "PY=python"
+if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
 
-if exist "..\.venv\Scripts\python.exe" (
-    echo [INFO] Starting with virtual environment...
-    "..\.venv\Scripts\python.exe" backend\app.py
-) else (
-    echo [INFO] Starting with Python...
-    python backend\app.py
+"%PY%" -c "import fastapi, googleapiclient" 2>nul || (
+    echo [SETUP] Installing requirements...
+    "%PY%" -m pip install -r requirements.txt || goto :error
 )
 
+"%PY%" backend\app.py
+if errorlevel 1 goto :error
+goto :eof
+
+:error
+echo.
+echo Gmail Zenith stopped with an error. See the message above.
 pause

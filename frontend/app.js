@@ -1,910 +1,946 @@
 /**
- * Gmail Zenith Pro — Frontend Application Logic
- * Fast asynchronous API communication, live stats charts, batch actions,
- * interactive dry-run preview, and GitHub notification triage.
+ * Gmail Zenith — dashboard logic.
+ * All dynamic content is escaped and wired through data-action attributes
+ * (no inline handlers), so email content can never execute as script.
  */
+(() => {
+  'use strict';
 
-class GmailZenithApp {
-  constructor() {
-    this.state = {
-      authenticated: false,
-      profile: null,
-      stats: null,
-      topSenders: [],
-      githubData: null,
-      activeGhCategory: 'all',
-      filterResults: [],
-      selectedMessageIds: new Set(),
-      pendingCleanQuery: null,
-      pendingCleanPreset: null,
-      logEntriesCount: 1,
+  // ---------------------------------------------------------------- helpers
+  const $ = (id) => document.getElementById(id);
+  const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const num = (n) => (typeof n === 'number' ? n.toLocaleString() : '—');
+  const plural = (n, word) => `${num(n)} ${word}${n === 1 ? '' : 's'}`;
+
+  function fmtSize(bytes) {
+    if (!bytes) return '—';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let i = 0;
+    while (bytes >= 1024 && i < units.length - 1) { bytes /= 1024; i++; }
+    return `${bytes.toFixed(i ? 1 : 0)} ${units[i]}`;
+  }
+
+  function fmtDate(ts) {
+    if (!ts) return '';
+    const d = new Date(ts);
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) {
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+    const opts = d.getFullYear() === now.getFullYear()
+      ? { month: 'short', day: 'numeric' }
+      : { year: 'numeric', month: 'short', day: 'numeric' };
+    return d.toLocaleDateString([], opts);
+  }
+
+  async function api(path, { method = 'GET', body, form } = {}) {
+    const opts = { method, headers: {} };
+    if (form) {
+      opts.body = form;
+    } else if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    const res = await fetch(path, opts);
+    let data = {};
+    try { data = await res.json(); } catch (_) { /* empty body */ }
+    if (!res.ok) {
+      let msg = data.detail || res.statusText || 'Request failed';
+      if (Array.isArray(msg)) msg = msg.map((d) => d.msg).join('; ');
+      const err = new Error(msg);
+      err.status = res.status;
+      if (res.status === 401) onSignedOut();
+      throw err;
+    }
+    return data;
+  }
+
+  const ICON = {
+    open: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>',
+    read: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>',
+    archive: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></svg>',
+    trash: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
+    search: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>',
+    unsub: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M13.73 21a2 2 0 0 1-3.46 0"/><path d="M18.63 13A17.9 17.9 0 0 1 18 8"/><path d="M6.26 6.26A5.86 5.86 0 0 0 6 8c0 7-3 9-3 9h14"/><path d="M18 8a6 6 0 0 0-9.33-5"/><path d="m2 2 20 20"/></svg>',
+  };
+
+  const ACTION_WORDS = {
+    trash: { verb: 'Move to Trash', done: 'moved to Trash' },
+    archive: { verb: 'Archive', done: 'archived' },
+    read: { verb: 'Mark as read', done: 'marked as read' },
+  };
+
+  const TAB_TITLES = {
+    overview: ['Overview', 'Exact inbox counts, clutter breakdown and top senders'],
+    cleaners: ['Cleaners', 'One-click cleanups with a preview first — and undo after'],
+    search: ['Search & Bulk', 'Any Gmail search, then act on selected or all matching emails'],
+    github: ['GitHub', 'Pull requests, issues, CI runs and security alerts in your inbox'],
+    autoclean: ['Auto-Clean', 'Rules that keep your inbox clean on a schedule'],
+    setup: ['Setup', 'Connect your Gmail account securely with Google OAuth'],
+  };
+
+  const BREAKDOWN = [
+    { key: 'primary', label: 'Primary', cls: 'other', query: 'in:inbox category:primary' },
+    { key: 'promotions', label: 'Promotions', cls: 'promotions', query: 'in:inbox category:promotions' },
+    { key: 'social', label: 'Social', cls: 'social', query: 'in:inbox category:social' },
+    { key: 'updates', label: 'Updates', cls: 'updates', query: 'in:inbox category:updates' },
+    { key: 'forums', label: 'Forums', cls: 'forums', query: 'in:inbox category:forums' },
+  ];
+
+  // ------------------------------------------------------------------ state
+  const state = {
+    auth: null,
+    tab: 'overview',
+    loaded: {},
+    search: { query: '', items: [], next: null, selected: new Set(), estimate: 0 },
+    github: { data: null, cat: 'all' },
+    ac: null,
+    modal: null,
+    logCount: 0,
+  };
+
+  // ------------------------------------------------------------ log & toast
+  function log(message, type = 'info') {
+    const row = document.createElement('div');
+    row.className = 'log-entry';
+    row.innerHTML = `<span class="log-time">${esc(new Date().toLocaleTimeString())}</span> `
+      + `<span class="log-tag ${esc(type)}">${esc(type.toUpperCase())}</span> ${esc(message)}`;
+    const body = $('log-body');
+    body.appendChild(row);
+    while (body.children.length > 200) body.firstChild.remove();
+    body.scrollTop = body.scrollHeight;
+    state.logCount++;
+    $('log-count').textContent = plural(state.logCount, 'event');
+  }
+
+  function toast(message, type = 'info', { undo, duration = 5000 } = {}) {
+    const el = document.createElement('div');
+    el.className = `toast toast-${type}`;
+    el.innerHTML = `<span>${esc(message)}</span>`;
+    if (undo) {
+      const btn = document.createElement('button');
+      btn.className = 'toast-btn';
+      btn.textContent = 'Undo';
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        dismiss();
+        await undo();
+      });
+      el.appendChild(btn);
+      duration = 12000;
+    }
+    const dismiss = () => {
+      el.classList.add('leaving');
+      setTimeout(() => el.remove(), 250);
     };
-
-    this.initElements();
-    this.initEventListeners();
-    this.checkAuthStatus();
+    $('toast-container').appendChild(el);
+    setTimeout(dismiss, duration);
   }
 
-  initElements() {
-    // Navigation
-    this.navButtons = document.querySelectorAll('.nav-item');
-    this.tabPanels = document.querySelectorAll('.tab-panel');
-    this.pageTitle = document.getElementById('page-title');
-    this.pageSubtitle = document.getElementById('page-subtitle');
-
-    // Status
-    this.statusDot = document.getElementById('status-dot');
-    this.statusTitle = document.getElementById('status-title');
-    this.statusEmail = document.getElementById('status-email');
-    this.btnQuickAuth = document.getElementById('btn-quick-auth');
-
-    // Stats
-    this.statInboxTotal = document.getElementById('stat-inbox-total');
-    this.statUnreadTotal = document.getElementById('stat-unread-total');
-    this.statPromotions = document.getElementById('stat-promotions');
-    this.statSocialUpdates = document.getElementById('stat-social-updates');
-    this.statGithubCount = document.getElementById('stat-github-count');
-    this.badgeInbox = document.getElementById('badge-inbox');
-    this.badgeGithub = document.getElementById('badge-github');
-    this.clutterPercentBadge = document.getElementById('clutter-percent-badge');
-    this.multiProgress = document.getElementById('multi-progress');
-    this.storageLargeCount = document.getElementById('storage-large-count');
-
-    // GitHub Triage
-    this.githubFeed = document.getElementById('github-feed-container');
-    this.ghTabButtons = document.querySelectorAll('.gh-tab-btn');
-
-    // Filter
-    this.filterQueryInput = document.getElementById('filter-query-input');
-    this.filterTableBody = document.getElementById('filter-table-body');
-    this.selectAllCheckbox = document.getElementById('select-all-results');
-    this.resultsCountLabel = document.getElementById('results-count-label');
-
-    // Quick Search Top Bar
-    this.quickSearchInput = document.getElementById('quick-search-input');
-    this.btnQuickSearch = document.getElementById('btn-quick-search');
-
-    // Modal
-    this.dryRunModal = document.getElementById('dry-run-modal');
-    this.modalTitle = document.getElementById('modal-title');
-    this.modalDesc = document.getElementById('modal-desc');
-    this.modalMatchedCount = document.getElementById('modal-matched-count');
-    this.modalStorageReclaimed = document.getElementById('modal-storage-reclaimed');
-    this.modalPreviewList = document.getElementById('modal-preview-list');
-
-    // Terminal
-    this.logConsoleDrawer = document.querySelector('.log-console-drawer');
-    this.logConsoleBody = document.getElementById('log-console-body');
-    this.logCount = document.getElementById('log-count');
-
-    // Setup
-    this.dropzone = document.getElementById('dropzone');
-    this.credentialsFileInput = document.getElementById('credentials-file-input');
+  function fail(context, err) {
+    if (err.status === 401) return; // handled by onSignedOut
+    toast(`${context}: ${err.message}`, 'danger', { duration: 7000 });
+    log(`${context}: ${err.message}`, 'danger');
   }
 
-  initEventListeners() {
-    // Tab switching
-    this.navButtons.forEach(btn => {
-      btn.addEventListener('click', () => {
-        const tab = btn.getAttribute('data-tab');
-        this.switchTab(tab);
-      });
-    });
-
-    // Refresh button
-    const btnRefresh = document.getElementById('btn-refresh-stats');
-    if (btnRefresh) {
-      btnRefresh.addEventListener('click', () => this.refreshAllData(true));
-    }
-
-    // Top Quick Search
-    if (this.btnQuickSearch && this.quickSearchInput) {
-      this.btnQuickSearch.addEventListener('click', () => {
-        const q = this.quickSearchInput.value.trim();
-        if (q) {
-          this.switchTab('filter');
-          this.filterQueryInput.value = q;
-          this.executeFilterSearch();
-        }
-      });
-      this.quickSearchInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          this.btnQuickSearch.click();
-        }
-      });
-    }
-
-    // Filter Query input enter key
-    if (this.filterQueryInput) {
-      this.filterQueryInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          this.executeFilterSearch();
-        }
-      });
-    }
-
-    // GitHub Sub-tabs
-    this.ghTabButtons.forEach(btn => {
-      btn.addEventListener('click', () => {
-        this.ghTabButtons.forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        this.state.activeGhCategory = btn.getAttribute('data-ghcat');
-        this.renderGitHubFeed();
-      });
-    });
-
-    // File Dropzone
-    if (this.dropzone && this.credentialsFileInput) {
-      this.dropzone.addEventListener('click', () => this.credentialsFileInput.click());
-      this.dropzone.addEventListener('dragover', (e) => {
-        e.preventDefault();
-        this.dropzone.style.borderColor = 'var(--accent-blue)';
-      });
-      this.dropzone.addEventListener('dragleave', () => {
-        this.dropzone.style.borderColor = 'var(--border-subtle)';
-      });
-      this.dropzone.addEventListener('drop', (e) => {
-        e.preventDefault();
-        this.dropzone.style.borderColor = 'var(--border-subtle)';
-        if (e.dataTransfer.files.length) {
-          this.uploadCredentialsFile(e.dataTransfer.files[0]);
-        }
-      });
-      this.credentialsFileInput.addEventListener('change', () => {
-        if (this.credentialsFileInput.files.length) {
-          this.uploadCredentialsFile(this.credentialsFileInput.files[0]);
-        }
-      });
-    }
+  function setBusy(el, busy) {
+    if (!el) return;
+    el.disabled = busy;
+    el.classList.toggle('is-loading', busy);
   }
 
-  // --- TAB NAVIGATION ---
-  switchTab(tabId) {
-    this.navButtons.forEach(btn => {
-      btn.classList.toggle('active', btn.getAttribute('data-tab') === tabId);
-    });
-
-    this.tabPanels.forEach(panel => {
-      panel.classList.toggle('active', panel.id === `tab-${tabId}`);
-    });
-
-    const titles = {
-      overview: ['Inbox Overview & Analytics', 'Real-time scan, clutter analytics, and fast triage engine'],
-      cleaners: ['1-Click Power Cleaners', 'Safely delete marketing, social, updates, and heavy files with 1-click'],
-      github: ['GitHub Triage Center', 'Pull requests, issues, failed workflows, and security alerts'],
-      filter: ['Universal Smart Filter', 'Custom Gmail query search, dry-run simulation, and batch actions'],
-      setup: ['Connection & Google OAuth', 'Manage official Google Cloud credentials and OAuth authentication'],
-    };
-
-    if (titles[tabId]) {
-      this.pageTitle.textContent = titles[tabId][0];
-      this.pageSubtitle.textContent = titles[tabId][1];
-    }
-
-    if (tabId === 'github' && (!this.state.githubData || !this.state.githubData.all.length)) {
-      this.loadGitHubTriage();
-    }
+  // ---------------------------------------------------------------- actions
+  async function runOnIds(ids, action, { silent = false } = {}) {
+    const res = await api('/api/actions/ids', { method: 'POST', body: { message_ids: ids, action } });
+    const msg = `${plural(res.count, 'email')} ${ACTION_WORDS[action].done}`;
+    log(msg, 'success');
+    if (!silent) toast(msg, 'success', { undo: res.undo.length ? () => undo(res.undo) : null });
+    return res;
   }
 
-  // --- LOGGING & TERMINAL ---
-  log(message, type = 'info') {
-    const timeStr = new Date().toLocaleTimeString();
-    const entry = document.createElement('div');
-    entry.className = 'log-entry';
-    entry.innerHTML = `<span class="log-time">[${timeStr}]</span> <span class="log-tag ${type}">[${type.toUpperCase()}]</span> ${message}`;
-    this.logConsoleBody.appendChild(entry);
-    this.logConsoleBody.scrollTop = this.logConsoleBody.scrollHeight;
-
-    this.state.logEntriesCount++;
-    if (this.logCount) {
-      this.logCount.textContent = `${this.state.logEntriesCount} events`;
-    }
-  }
-
-  toggleLogConsole() {
-    this.logConsoleDrawer.classList.toggle('collapsed');
-  }
-
-  // --- TOAST NOTIFICATIONS ---
-  showToast(message, type = 'info') {
-    const container = document.getElementById('toast-container');
-    const toast = document.createElement('div');
-    toast.className = `toast toast-${type}`;
-    toast.innerHTML = `<span>${message}</span>`;
-    container.appendChild(toast);
-
-    setTimeout(() => {
-      toast.style.opacity = '0';
-      toast.style.transform = 'translateY(-10px)';
-      setTimeout(() => toast.remove(), 300);
-    }, 4000);
-  }
-
-  // --- AUTH STATUS CHECKER ---
-  async checkAuthStatus() {
+  async function undo(ops) {
     try {
-      const res = await fetch('/api/auth/status');
-      const data = await res.json();
-      this.state.authenticated = data.authenticated;
-      this.state.profile = data.profile;
-
-      if (data.authenticated && data.profile) {
-        this.statusDot.classList.add('online');
-        this.statusTitle.textContent = 'Connected (Google OAuth)';
-        this.statusEmail.textContent = data.profile.email;
-        this.log(`Authenticated as ${data.profile.email}`, 'success');
-        this.refreshAllData();
-      } else {
-        this.statusDot.classList.remove('online');
-        this.statusTitle.textContent = data.hasCredentials ? 'Needs Authentication' : 'Setup Required';
-        this.statusEmail.textContent = data.hasCredentials ? 'Click to login' : 'Upload credentials.json';
-        this.log('Waiting for Google OAuth authentication...', 'warn');
-      }
-    } catch (e) {
-      this.statusTitle.textContent = 'Backend Offline';
-      this.statusEmail.textContent = 'Checking localhost:8767...';
-      this.log(`Failed to connect to backend: ${e}`, 'danger');
-    }
+      const res = await api('/api/actions/undo', { method: 'POST', body: { ops } });
+      toast(`Undone — ${plural(res.count, 'email')} restored`, 'info');
+      log(`Undo restored ${res.count} email(s).`, 'info');
+      afterChange();
+      refreshCurrent(true);
+    } catch (e) { fail('Undo failed', e); }
   }
 
-  // --- REFRESH ALL DATA ---
-  async refreshAllData(showToasts = false) {
-    if (!this.state.authenticated) {
-      this.checkAuthStatus();
+  function afterChange() {
+    state.loaded = { [state.tab]: state.loaded[state.tab] };
+    loadStats();
+  }
+
+  // ------------------------------------------------------------- navigation
+  function switchTab(tab) {
+    if (!TAB_TITLES[tab]) return;
+    state.tab = tab;
+    document.querySelectorAll('.nav-item').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+    document.querySelectorAll('.tab-panel').forEach((p) => p.classList.toggle('active', p.id === `tab-${tab}`));
+    $('page-title').textContent = TAB_TITLES[tab][0];
+    $('page-subtitle').textContent = TAB_TITLES[tab][1];
+    try { localStorage.setItem('zenith.tab', tab); } catch (_) { /* storage unavailable */ }
+    refreshCurrent(false);
+  }
+
+  function refreshCurrent(force) {
+    const tab = state.tab;
+    if (tab === 'setup') return renderSetup();
+    if (tab === 'autoclean') return loadAutoClean(force);
+    if (!state.auth?.authenticated) return;
+    if (!force && state.loaded[tab]) return;
+    state.loaded[tab] = true;
+    if (tab === 'overview') { loadStats(); loadSenders(); }
+    if (tab === 'cleaners') loadPresets();
+    if (tab === 'github') loadGitHub();
+    if (tab === 'search') runSearch(state.search.query || $('search-input').value || 'in:inbox');
+  }
+
+  // ------------------------------------------------------------------- auth
+  async function checkAuth() {
+    try {
+      state.auth = await api('/api/auth/status');
+    } catch (e) {
+      $('status-title').textContent = 'Server offline';
+      $('status-email').textContent = 'Start run_gmail_zenith.bat';
+      log(`Cannot reach the local server: ${e.message}`, 'danger');
       return;
     }
+    const a = state.auth;
+    $('status-dot').classList.toggle('online', a.authenticated);
+    $('connect-banner').hidden = a.authenticated;
+    if (a.authenticated) {
+      $('status-title').textContent = 'Connected';
+      $('status-email').textContent = a.profile?.email || '';
+      log(`Connected as ${a.profile?.email}`, 'success');
+      loadStats();
+    } else {
+      $('status-title').textContent = a.hasCredentials ? 'Not signed in' : 'Setup needed';
+      $('status-email').textContent = a.hasCredentials ? 'Click to connect' : 'Upload credentials.json';
+    }
+    renderSetup();
+    refreshCurrent(true);
+  }
 
-    this.log('Initiating inbox scan & analytics refresh...', 'info');
+  function onSignedOut() {
+    if (state.auth) state.auth.authenticated = false;
+    $('status-dot').classList.remove('online');
+    $('status-title').textContent = 'Not signed in';
+    $('status-email').textContent = 'Click to connect';
+    $('connect-banner').hidden = false;
+  }
+
+  function renderSetup() {
+    const a = state.auth || {};
+    $('redirect-uri').textContent = a.redirectUri || `${location.origin}/oauth2callback`;
+    const rows = [
+      [a.hasCredentials, 'OAuth client', a.hasCredentials
+        ? `credentials.json found (${a.clientType === 'web' ? 'Web application' : 'Desktop app'} client)`
+        : 'Upload credentials.json (step 2)'],
+      [a.authenticated, 'Gmail account', a.authenticated ? a.profile?.email : 'Not connected yet (step 3)'],
+    ];
+    $('setup-status').innerHTML = rows.map(([ok, title, text]) => `
+      <div class="status-row ${ok ? 'ok' : ''}">
+        <span class="status-check">${ok ? '✓' : '•'}</span>
+        <div><b>${esc(title)}</b><span>${esc(text)}</span></div>
+      </div>`).join('')
+      + (a.authenticated && a.profile ? `<div class="status-row ok"><span class="status-check">✓</span>
+        <div><b>Mailbox</b><span>${num(a.profile.messagesTotal)} messages · ${num(a.profile.threadsTotal)} threads</span></div></div>` : '');
+    $('btn-connect').disabled = !a.hasCredentials;
+    $('btn-connect').lastChild.textContent = a.authenticated ? ' Reconnect / switch account' : ' Connect Gmail';
+    $('btn-logout').hidden = !a.authenticated;
+    $('setup-guide').open = !a.authenticated;
+  }
+
+  async function uploadCredentials(file) {
+    if (!file) return;
+    const form = new FormData();
+    form.append('file', file);
     try {
-      await Promise.all([
-        this.loadInboxStats(),
-        this.loadTopSenders(),
-      ]);
-      if (showToasts) this.showToast('Inbox analytics refreshed successfully!', 'success');
-      this.log('Inbox analytics updated successfully.', 'success');
+      await api('/api/auth/upload-credentials', { method: 'POST', form });
+      toast('credentials.json saved — now click Connect Gmail.', 'success');
+      log(`Saved OAuth client from ${file.name}.`, 'success');
+      await checkAuth();
+    } catch (e) { fail('Upload failed', e); }
+  }
+
+  async function connect() {
+    try {
+      const { auth_url: url } = await api('/api/auth/url');
+      log('Opening Google sign-in…');
+      const popup = window.open(url, 'zenith-google-auth', 'width=560,height=720');
+      if (!popup) { location.href = url; return; }
+      const started = Date.now();
+      const timer = setInterval(async () => {
+        if (Date.now() - started > 5 * 60 * 1000) return clearInterval(timer);
+        if (popup.closed) {
+          clearInterval(timer);
+          await checkAuth();
+          if (state.auth?.authenticated) toast('Gmail connected!', 'success');
+        }
+      }, 1000);
+    } catch (e) { fail('Sign-in failed', e); }
+  }
+
+  window.addEventListener('message', (e) => {
+    if (e.origin === location.origin && e.data === 'oauth_complete') {
+      checkAuth().then(() => toast('Gmail connected!', 'success'));
+    }
+  });
+
+  async function logout() {
+    if (!confirm('Disconnect this Gmail account? The saved token on this computer will be deleted.')) return;
+    try {
+      await api('/api/auth/logout', { method: 'POST' });
+      toast('Disconnected.', 'info');
+      state.loaded = {};
+      await checkAuth();
+    } catch (e) { fail('Logout failed', e); }
+  }
+
+  // --------------------------------------------------------------- overview
+  let statsInFlight = null;
+  function loadStats() {
+    if (!state.auth?.authenticated) return Promise.resolve();
+    if (!statsInFlight) statsInFlight = fetchStats().finally(() => { statsInFlight = null; });
+    return statsInFlight;
+  }
+
+  async function fetchStats() {
+    const btn = $('btn-refresh');
+    setBusy(btn, true);
+    try {
+      const { counts: c } = await api('/api/stats/inbox');
+      const clutter = c.promotions + c.social + c.updates + c.forums;
+      const pct = c.inbox ? Math.round((clutter / c.inbox) * 100) : 0;
+      $('stat-inbox').textContent = num(c.inbox);
+      $('stat-unread').textContent = `${num(c.unread)} unread`;
+      $('stat-clutter').textContent = num(clutter);
+      $('stat-clutter-pct').textContent = `${pct}% of inbox`;
+      $('stat-large').textContent = num(c.largeFiles);
+      $('stat-github').textContent = num(c.github);
+      $('spam-pill').textContent = `Spam: ${num(c.spam)} · Trash: ${num(c.trash)}`;
+      setBadge('badge-inbox', c.inbox > 999 ? '999+' : c.inbox);
+      setBadge('badge-clutter', clutter > 999 ? '999+' : clutter);
+      setBadge('badge-github', c.github);
+
+      const total = Math.max(1, BREAKDOWN.reduce((s, b) => s + (c[b.key] || 0), 0));
+      $('breakdown-bar').innerHTML = BREAKDOWN.map((b) => {
+        const w = ((c[b.key] || 0) / total) * 100;
+        return w ? `<div class="bar-seg seg-${b.cls}" style="width:${w}%" title="${esc(b.label)}: ${num(c[b.key])}"></div>` : '';
+      }).join('');
+      $('breakdown-legend').innerHTML = BREAKDOWN.map((b) => `
+        <button class="legend-item" data-action="search" data-query="${esc(b.query)}">
+          <span class="dot dot-${b.cls}"></span>${esc(b.label)}
+          <b>${num(c[b.key])}</b><small>${Math.round(((c[b.key] || 0) / total) * 100)}%</small>
+        </button>`).join('');
     } catch (e) {
-      this.log(`Error updating stats: ${e.message}`, 'danger');
+      fail('Could not load inbox counts', e);
+    } finally {
+      setBusy(btn, false);
     }
   }
 
-  // --- LOAD INBOX STATS ---
-  async loadInboxStats() {
-    try {
-      const res = await fetch('/api/stats/inbox');
-      if (!res.ok) return;
-      const data = await res.json();
-      this.state.stats = data;
-
-      const counts = data.counts || {};
-      const totalInbox = counts.inbox || 0;
-      const unread = counts.unread || 0;
-      const promotions = counts.promotions || 0;
-      const social = counts.social || 0;
-      const updates = counts.updates || 0;
-      const spam = counts.spam || 0;
-      const github = counts.github || 0;
-      const largeFiles = counts.largeFiles || 0;
-
-      // Update UI cards
-      this.statInboxTotal.textContent = totalInbox.toLocaleString();
-      this.statUnreadTotal.textContent = `${unread.toLocaleString()} unread`;
-      this.statPromotions.textContent = promotions.toLocaleString();
-      this.statSocialUpdates.textContent = (social + updates).toLocaleString();
-      this.statGithubCount.textContent = github.toLocaleString();
-      this.storageLargeCount.textContent = largeFiles.toLocaleString();
-
-      this.badgeInbox.textContent = totalInbox > 999 ? '999+' : totalInbox;
-      this.badgeGithub.textContent = github;
-
-      // Clutter metrics
-      const totalClutter = promotions + social + updates + spam;
-      const clutterPercent = totalInbox > 0 ? Math.min(100, Math.round((totalClutter / totalInbox) * 100)) : 0;
-      this.clutterPercentBadge.textContent = `${clutterPercent}% Clutter`;
-
-      // Legend
-      document.getElementById('leg-promotions').textContent = promotions.toLocaleString();
-      document.getElementById('leg-social').textContent = social.toLocaleString();
-      document.getElementById('leg-updates').textContent = updates.toLocaleString();
-      document.getElementById('leg-spam').textContent = spam.toLocaleString();
-
-      // Multi-progress bar widths
-      const denom = Math.max(1, promotions + social + updates + totalInbox);
-      const pProm = (promotions / denom) * 100;
-      const pSoc = (social / denom) * 100;
-      const pUpd = (updates / denom) * 100;
-      const pOther = Math.max(5, 100 - (pProm + pSoc + pUpd));
-
-      this.multiProgress.innerHTML = `
-        <div class="bar-seg seg-promotions" style="width: ${pProm}%" title="Promotions: ${promotions}"></div>
-        <div class="bar-seg seg-social" style="width: ${pSoc}%" title="Social: ${social}"></div>
-        <div class="bar-seg seg-updates" style="width: ${pUpd}%" title="Updates: ${updates}"></div>
-        <div class="bar-seg seg-other" style="width: ${pOther}%" title="Other"></div>
-      `;
-    } catch (e) {
-      console.error(e);
-    }
+  function setBadge(id, value) {
+    const el = $(id);
+    el.hidden = !value;
+    el.textContent = value;
   }
 
-  // --- LOAD TOP SENDERS ---
-  async loadTopSenders() {
-    const tbody = document.getElementById('senders-table-body');
+  async function loadSenders() {
+    if (!state.auth?.authenticated) return;
+    const body = $('senders-body');
+    body.innerHTML = `<tr><td colspan="5" class="empty-cell"><span class="spinner"></span> Analysing your latest inbox emails…</td></tr>`;
     try {
-      const res = await fetch('/api/stats/top-senders?limit=80');
-      if (!res.ok) return;
-      const data = await res.json();
-      const senders = data.senders || [];
-      this.state.topSenders = senders;
-
+      const { senders, scanned } = await api('/api/stats/top-senders?limit=300');
+      $('senders-desc').textContent = `Who fills your inbox the most, based on your latest ${num(scanned)} inbox emails`;
       if (!senders.length) {
-        tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted">No senders analyzed yet.</td></tr>`;
+        body.innerHTML = `<tr><td colspan="5" class="empty-cell">Your inbox is empty. Nice!</td></tr>`;
         return;
       }
-
-      const maxCount = Math.max(...senders.map(s => s.count), 1);
-
-      tbody.innerHTML = senders.map(s => {
-        const pct = Math.round((s.count / maxCount) * 100);
-        return `
-          <tr>
-            <td>
-              <div class="sender-tag">${this.escapeHtml(s.name)}</div>
-              <div class="sender-email-small">${this.escapeHtml(s.email)}</div>
-            </td>
-            <td><b>${s.count}</b> emails</td>
-            <td>
-              <div class="impact-mini-bar">
-                <div class="impact-mini-fill" style="width: ${pct}%"></div>
-              </div>
-            </td>
-            <td class="text-right">
-              <button class="btn btn-sm btn-secondary" onclick="app.previewClean('from:${this.escapeHtml(s.email || s.name)}', 'All mail from ${this.escapeHtml(s.name)}')">
-                Preview Clean
-              </button>
-            </td>
-          </tr>
-        `;
+      const max = Math.max(...senders.map((s) => s.count));
+      body.innerHTML = senders.map((s) => {
+        const q = s.email ? `from:${s.email}` : `from:"${s.name}"`;
+        const canUnsub = s.unsubscribe && (s.unsubscribe.url || s.unsubscribe.mailto);
+        return `<tr>
+          <td class="col-sender">
+            <div class="sender-tag">${esc(s.name)}</div>
+            <div class="sender-email-small">${esc(s.email)}</div>
+          </td>
+          <td class="col-count">
+            <div class="count-cell"><b>${num(s.count)}</b>
+              <div class="impact-mini-bar"><div class="impact-mini-fill" style="width:${Math.round((s.count / max) * 100)}%"></div></div>
+            </div>
+          </td>
+          <td class="hide-sm">${num(s.unread)}</td>
+          <td class="hide-sm">${esc(s.size)}</td>
+          <td class="text-right nowrap col-actions">
+            <button class="icon-btn" title="Show all emails from this sender" data-action="search" data-query="${esc(q)}">${ICON.search}</button>
+            ${canUnsub ? `<button class="icon-btn" title="Unsubscribe" data-action="unsubscribe" data-id="${esc(s.sampleId)}" data-name="${esc(s.name)}">${ICON.unsub}</button>` : ''}
+            <button class="btn btn-sm btn-rose" data-action="preview" data-query="${esc(q)}" data-title="All email from ${esc(s.name)}">Clean</button>
+          </td>
+        </tr>`;
       }).join('');
     } catch (e) {
-      tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted">Failed to load top senders.</td></tr>`;
+      body.innerHTML = `<tr><td colspan="5" class="empty-cell">Could not analyse senders: ${esc(e.message)}</td></tr>`;
     }
   }
 
-  // --- 1-CLICK QUICK CLEAN ---
-  async quickClean(presetName) {
-    if (!this.state.authenticated) {
-      this.showToast('Please connect your Google Account first.', 'danger');
-      this.switchTab('setup');
-      return;
-    }
+  async function unsubscribe(id, name) {
+    if (!confirm(`Unsubscribe from ${name}?`)) return;
+    try {
+      const res = await api('/api/unsubscribe', { method: 'POST', body: { message_id: id } });
+      if (res.success) {
+        toast(`Unsubscribed from ${name}.`, 'success');
+        log(`One-click unsubscribe from ${name} succeeded.`, 'success');
+      } else if (res.url) {
+        window.open(res.url, '_blank', 'noopener');
+        toast(`Opened ${name}'s unsubscribe page — finish there.`, 'info', { duration: 7000 });
+      } else if (res.mailto) {
+        location.href = res.mailto;
+        toast(`Opened an unsubscribe email to ${name} — just send it.`, 'info', { duration: 7000 });
+      }
+    } catch (e) { fail('Unsubscribe failed', e); }
+  }
 
-    const presetDescriptions = {
-      promotions: 'Promotional & Marketing Emails',
-      social: 'Social Media Notifications',
-      updates: 'Automated Updates & Newsletters',
-      spam: 'Spam Box Emails',
-      large_files: 'Large Attachments (>10MB)',
-      older_than_1y: 'Emails Older Than 1 Year',
+  // --------------------------------------------------------------- cleaners
+  async function loadPresets() {
+    const grid = $('cleaners-grid');
+    if (!grid.children.length) {
+      grid.innerHTML = `<div class="feed-empty-state"><span class="spinner"></span> Counting matching emails…</div>`;
+    }
+    try {
+      const { presets } = await api('/api/presets?counts=true');
+      grid.innerHTML = presets.map((p) => `
+        <div class="glass-card cleaner-card accent-${esc(p.color)}">
+          <div class="cleaner-top">
+            <h3>${esc(p.title)}</h3>
+            <span class="cleaner-count ${p.count ? '' : 'zero'}">${p.count ? num(p.count) + (p.capped ? '+' : '') : 'Clean'}</span>
+          </div>
+          <p>${esc(p.description)}</p>
+          <code class="cleaner-query">${esc(p.query)}</code>
+          <div class="cleaner-buttons">
+            <button class="btn btn-secondary btn-sm" data-action="search" data-query="${esc(p.query)}">View</button>
+            <button class="btn btn-rose btn-sm" data-action="preview" data-query="${esc(p.query)}" data-title="${esc(p.title)}" ${p.count ? '' : 'disabled'}>Review &amp; clean</button>
+          </div>
+        </div>`).join('');
+    } catch (e) {
+      grid.innerHTML = `<div class="feed-empty-state">Could not load cleaners: ${esc(e.message)}</div>`;
+    }
+  }
+
+  // ------------------------------------------------------------------ modal
+  async function openPreview(query, title, action = 'trash') {
+    if (!state.auth?.authenticated) { switchTab('setup'); return toast('Connect Gmail first.', 'warn'); }
+    state.modal = { query, title, count: 0 };
+    $('modal-title').textContent = title || 'Review before cleaning';
+    $('modal-query').textContent = `${query}  ·  starred excluded`;
+    $('modal-count').textContent = '…';
+    $('modal-size').textContent = '…';
+    $('modal-action').value = action;
+    $('modal-list').innerHTML = `<div class="empty-cell"><span class="spinner"></span> Counting matches…</div>`;
+    $('modal-confirm').disabled = true;
+    updateModalNote();
+    $('preview-modal').classList.add('active');
+    try {
+      const p = await api('/api/actions/preview', { method: 'POST', body: { query } });
+      if (!state.modal || state.modal.query !== query) return;
+      state.modal.count = p.count;
+      state.modal.capped = p.capped;
+      $('modal-count').textContent = num(p.count) + (p.capped ? '+' : '');
+      $('modal-size').textContent = p.count ? `≈ ${p.estimatedSize}` : '—';
+      $('modal-list').innerHTML = p.sample.length ? p.sample.map((m) => `
+        <div class="preview-item-row">
+          <div class="pi-top"><b>${esc(m.senderName)}</b><span>${esc(fmtDate(m.timestamp))}</span></div>
+          <div class="pi-subject">${esc(m.subject)}</div>
+          <div class="pi-snippet">${esc(m.snippet)}</div>
+        </div>`).join('')
+        + (p.count > p.sample.length ? `<div class="pi-more">…and ${num(p.count - p.sample.length)} more</div>` : '')
+        : `<div class="empty-cell">Nothing matches — all clean!</div>`;
+      $('modal-confirm').disabled = !p.count;
+      updateModalNote();
+    } catch (e) {
+      $('modal-list').innerHTML = `<div class="empty-cell text-rose">${esc(e.message)}</div>`;
+    }
+  }
+
+  function updateModalNote() {
+    const action = $('modal-action').value;
+    const m = state.modal || {};
+    const n = m.count || 0;
+    const words = ACTION_WORDS[action];
+    const capNote = n >= 5000 || m.capped ? ' Up to 5,000 per run — run it again for the rest.' : '';
+    const notes = {
+      trash: 'Trash is kept for 30 days, and you can undo right after.',
+      archive: 'Emails leave the inbox but stay searchable in All Mail.',
+      read: 'Only unread emails are changed.',
     };
+    $('modal-note').textContent = notes[action] + capNote;
+    $('modal-confirm').textContent = n ? `${words.verb} (${num(Math.min(n, 5000))})` : words.verb;
+    $('modal-confirm').className = `btn ${action === 'trash' ? 'btn-rose' : 'btn-primary'}`;
+    $('modal-confirm').disabled = !n;
+  }
 
-    const label = presetDescriptions[presetName] || presetName;
-    if (!confirm(`Are you sure you want to clean ${label}? They will be safely moved to your Gmail Trash (recoverable for 30 days).`)) {
+  function closeModal() {
+    $('preview-modal').classList.remove('active');
+    state.modal = null;
+  }
+
+  async function confirmModal() {
+    if (!state.modal) return;
+    const { query } = state.modal;
+    const action = $('modal-action').value;
+    const btn = $('modal-confirm');
+    setBusy(btn, true);
+    btn.textContent = 'Working…';
+    try {
+      const res = await api('/api/actions/query', { method: 'POST', body: { query, action } });
+      closeModal();
+      const msg = `${plural(res.count, 'email')} ${ACTION_WORDS[action].done}` + (res.more ? ' (more remain — run again)' : '');
+      log(`${msg} · ${res.query}`, 'success');
+      toast(msg, 'success', { undo: res.undo.length ? () => undo(res.undo) : null });
+      afterChange();
+      refreshCurrent(true);
+    } catch (e) {
+      fail('Action failed', e);
+    } finally {
+      setBusy(btn, false);
+      if (state.modal) updateModalNote();
+    }
+  }
+
+  // ----------------------------------------------------------------- search
+  async function runSearch(query, { append = false } = {}) {
+    query = (query || '').trim() || 'in:inbox';
+    if (state.tab !== 'search') {
+      state.search.query = query;
+      $('search-input').value = query;
+      state.loaded.search = false;
+      switchTab('search');
       return;
     }
-
-    this.log(`Executing 1-Click Clean for [${presetName}]...`, 'info');
+    if (!state.auth?.authenticated) return toast('Connect Gmail first.', 'warn');
+    const s = state.search;
+    const body = $('search-body');
+    $('search-input').value = query;
+    if (!append) {
+      Object.assign(s, { query, items: [], next: null });
+      s.selected.clear();
+      body.innerHTML = `<tr><td colspan="6" class="empty-cell"><span class="spinner"></span> Searching…</td></tr>`;
+    }
+    state.loaded.search = true;
     try {
-      const res = await fetch('/api/clean/preset', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ preset: presetName, max_items: 100 }),
-      });
-
-      const data = await res.json();
-      if (data.success) {
-        this.log(`Successfully moved ${data.count} ${label} to Trash!`, 'success');
-        this.showToast(`Cleaned ${data.count} emails!`, 'success');
-        this.refreshAllData();
-      } else {
-        this.log(`Clean failed: ${data.error}`, 'danger');
-        this.showToast(`Error: ${data.error}`, 'danger');
-      }
+      const params = new URLSearchParams({ q: query, max_results: '50' });
+      if (append && s.next) params.set('page_token', s.next);
+      const data = await api(`/api/search?${params}`);
+      if (s.query !== query) return;
+      s.items = append ? s.items.concat(data.messages) : data.messages;
+      s.next = data.nextPageToken;
+      s.estimate = data.resultSizeEstimate;
+      renderSearch();
     } catch (e) {
-      this.log(`Request error: ${e.message}`, 'danger');
+      body.innerHTML = `<tr><td colspan="6" class="empty-cell text-rose">${esc(e.message)}</td></tr>`;
     }
   }
 
-  // --- DRY RUN & SIMULATION PREVIEW ---
-  async previewClean(query, title = 'Custom Clean Preview') {
-    if (!this.state.authenticated) {
-      this.showToast('Please connect your Google Account first.', 'danger');
-      this.switchTab('setup');
-      return;
-    }
-
-    this.state.pendingCleanQuery = query;
-    this.modalTitle.textContent = `Preview: ${title}`;
-    this.modalDesc.textContent = `Query: "${query}". Review the matched emails before proceeding:`;
-    this.modalMatchedCount.textContent = 'Scanning...';
-    this.modalStorageReclaimed.textContent = '-- MB';
-    this.modalPreviewList.innerHTML = `<div class="text-center text-muted p-4">Scanning inbox with Gmail API...</div>`;
-    this.dryRunModal.classList.add('active');
-
-    try {
-      const res = await fetch('/api/clean/simulate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: query, max_scan: 50 }),
-      });
-
-      const data = await res.json();
-      this.modalMatchedCount.textContent = (data.matchedCount || 0).toLocaleString();
-      this.modalStorageReclaimed.textContent = data.estimatedSizeFormatted || '0 MB';
-
-      const sample = data.sample || [];
-      if (!sample.length) {
-        this.modalPreviewList.innerHTML = `<div class="text-center text-muted p-4">No matching emails found for this query.</div>`;
-      } else {
-        this.modalPreviewList.innerHTML = sample.map(m => `
-          <div class="preview-item-row">
-            <div style="font-weight: 700;">${this.escapeHtml(m.senderName)} <span style="font-size:0.75rem; color:var(--text-muted); font-weight:normal;">(${this.escapeHtml(m.date)})</span></div>
-            <div style="color:var(--text-primary); margin-top:2px;">${this.escapeHtml(m.subject)}</div>
-            <div style="color:var(--text-muted); font-size:0.75rem;">${this.escapeHtml(m.snippet)}</div>
-          </div>
-        `).join('');
-      }
-    } catch (e) {
-      this.modalPreviewList.innerHTML = `<div class="text-center text-rose p-4">Error scanning: ${e.message}</div>`;
-    }
-  }
-
-  closeModal() {
-    this.dryRunModal.classList.remove('active');
-    this.state.pendingCleanQuery = null;
-  }
-
-  async executeConfirmedClean() {
-    if (!this.state.pendingCleanQuery) return;
-    const query = this.state.pendingCleanQuery;
-    this.closeModal();
-
-    this.log(`Executing batch trash for query: "${query}"...`, 'info');
-    try {
-      // First search for IDs matching query
-      const searchRes = await fetch(`/api/search?q=${encodeURIComponent(query)}&max_results=100`);
-      const searchData = await searchRes.json();
-      const ids = (searchData.messages || []).map(m => m.id);
-
-      if (!ids.length) {
-        this.showToast('No matching emails found to trash.', 'info');
-        return;
-      }
-
-      const trashRes = await fetch('/api/batch/trash', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message_ids: ids }),
-      });
-
-      const trashData = await trashRes.json();
-      if (trashData.success) {
-        this.log(`Moved ${trashData.count} emails to Trash!`, 'success');
-        this.showToast(`Cleaned ${trashData.count} emails to Trash!`, 'success');
-        this.refreshAllData();
-      } else {
-        this.showToast(`Error: ${trashData.error}`, 'danger');
-      }
-    } catch (e) {
-      this.log(`Batch execution error: ${e.message}`, 'danger');
-    }
-  }
-
-  // --- GITHUB TRIAGE CENTER ---
-  async loadGitHubTriage() {
-    if (!this.state.authenticated) return;
-    this.githubFeed.innerHTML = `<div class="feed-empty-state"><p>Scanning GitHub notifications...</p></div>`;
-
-    try {
-      const res = await fetch('/api/github/triage?max_results=60');
-      const data = await res.json();
-      this.state.githubData = data;
-
-      const catCounts = {
-        all: data.total || 0,
-        pr: (data.categorized.pull_requests || []).length,
-        issues: (data.categorized.issues || []).length,
-        ci: (data.categorized.ci_cd || []).length,
-        sec: (data.categorized.security || []).length,
-        rel: (data.categorized.releases || []).length,
-      };
-
-      document.getElementById('gh-count-all').textContent = catCounts.all;
-      document.getElementById('gh-count-pr').textContent = catCounts.pr;
-      document.getElementById('gh-count-issues').textContent = catCounts.issues;
-      document.getElementById('gh-count-ci').textContent = catCounts.ci;
-      document.getElementById('gh-count-sec').textContent = catCounts.sec;
-      document.getElementById('gh-count-rel').textContent = catCounts.rel;
-
-      this.renderGitHubFeed();
-    } catch (e) {
-      this.githubFeed.innerHTML = `<div class="feed-empty-state"><p class="text-rose">Error loading GitHub emails: ${e.message}</p></div>`;
-    }
-  }
-
-  renderGitHubFeed() {
-    if (!this.state.githubData) return;
-
-    const cat = this.state.activeGhCategory;
-    const items = cat === 'all' ? this.state.githubData.all : (this.state.githubData.categorized[cat] || []);
-
-    if (!items.length) {
-      this.githubFeed.innerHTML = `
-        <div class="feed-empty-state">
-          <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="20 6 9 17 4 12"/></svg>
-          <p>Zero unhandled notifications in this category. You are all caught up!</p>
-        </div>
-      `;
-      return;
-    }
-
-    const badgeClassMap = {
-      pull_requests: 'badge-pr',
-      issues: 'badge-issue',
-      ci_cd: 'badge-ci',
-      security: 'badge-sec',
-      releases: 'badge-rel',
-      general: 'badge-pr',
-    };
-
-    this.githubFeed.innerHTML = items.map(item => {
-      const meta = item.githubMeta || {};
-      const isUnread = item.labelIds && item.labelIds.includes('UNREAD');
-      const bClass = badgeClassMap[meta.category] || 'badge-pr';
-
-      return `
-        <div class="gh-item-card ${isUnread ? 'is-unread' : ''}" id="gh-card-${item.id}">
-          <div class="gh-badge-tag ${bClass}">
-            <span>${meta.badge || 'GitHub'}</span>
-          </div>
-
-          <div class="gh-content-col">
-            <div class="gh-subject">${this.escapeHtml(item.subject)}</div>
-            <div class="gh-snippet">${this.escapeHtml(item.snippet)}</div>
-            <div class="gh-meta-row">
-              <span>📅 ${this.escapeHtml(item.date)}</span>
-              ${meta.repo ? `<span>📦 <b>${this.escapeHtml(meta.repo)}</b></span>` : ''}
-              ${item.hasAttachment ? `<span>📎 Attachment</span>` : ''}
-            </div>
-          </div>
-
-          <div class="gh-actions-col">
-            <a href="${this.escapeHtml(meta.url || 'https://github.com/notifications')}" target="_blank" class="btn btn-sm btn-secondary" title="Open on GitHub">
-              Open Thread ↗
-            </a>
-            <button class="btn btn-sm btn-secondary" onclick="app.actionMessage('${item.id}', 'read')" title="Mark as Read">
-              ✓
-            </button>
-            <button class="btn btn-sm btn-rose" onclick="app.actionMessage('${item.id}', 'trash')" title="Move to Trash">
-              🗑️
-            </button>
-          </div>
-        </div>
-      `;
-    }).join('');
-  }
-
-  async markAllGitHubRead() {
-    if (!this.state.githubData || !this.state.githubData.all.length) return;
-    const ids = this.state.githubData.all.map(m => m.id);
-
-    try {
-      await fetch('/api/batch/labels', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message_ids: ids, remove_labels: ['UNREAD'] }),
-      });
-      this.showToast('Marked all GitHub notifications as read!', 'success');
-      this.log('Marked all current GitHub notifications as read.', 'success');
-      this.loadGitHubTriage();
-    } catch (e) {
-      this.showToast(`Error: ${e.message}`, 'danger');
-    }
-  }
-
-  async actionMessage(messageId, action) {
-    try {
-      if (action === 'trash') {
-        await fetch('/api/batch/trash', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message_ids: [messageId] }),
-        });
-        const el = document.getElementById(`gh-card-${messageId}`);
-        if (el) el.remove();
-        this.showToast('Moved to Trash.', 'info');
-      } else if (action === 'read') {
-        await fetch('/api/batch/labels', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message_ids: [messageId], remove_labels: ['UNREAD'] }),
-        });
-        const el = document.getElementById(`gh-card-${messageId}`);
-        if (el) el.classList.remove('is-unread');
-        this.showToast('Marked as read.', 'info');
-      }
-    } catch (e) {
-      this.showToast(`Error: ${e.message}`, 'danger');
-    }
-  }
-
-  // --- UNIVERSAL FILTER & SMART SEARCH ---
-  setFilterQuery(query) {
-    this.filterQueryInput.value = query;
-    this.executeFilterSearch();
-  }
-
-  async executeFilterSearch() {
-    if (!this.state.authenticated) {
-      this.showToast('Please connect your Google Account first.', 'danger');
-      return;
-    }
-
-    const query = this.filterQueryInput.value.trim() || 'in:inbox';
-    this.filterTableBody.innerHTML = `<tr><td colspan="6" class="text-center text-muted">Searching Gmail for "${this.escapeHtml(query)}"...</td></tr>`;
-    this.state.selectedMessageIds.clear();
-    this.updateSelectedCountUI();
-
-    try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(query)}&max_results=50`);
-      const data = await res.json();
-      const messages = data.messages || [];
-      this.state.filterResults = messages;
-
-      if (!messages.length) {
-        this.filterTableBody.innerHTML = `<tr><td colspan="6" class="text-center text-muted">No matching emails found for query.</td></tr>`;
-        return;
-      }
-
-      this.filterTableBody.innerHTML = messages.map(m => `
-        <tr>
-          <td>
-            <input type="checkbox" class="result-row-check" value="${m.id}" onchange="app.toggleMessageSelect('${m.id}', this.checked)">
-          </td>
-          <td>
-            <div class="sender-tag">${this.escapeHtml(m.senderName)}</div>
-            <div class="sender-email-small">${this.escapeHtml(m.senderEmail)}</div>
-          </td>
-          <td>
-            <div style="font-weight: 700; color: var(--text-primary);">${this.escapeHtml(m.subject)}</div>
-            <div style="color: var(--text-muted); font-size: 0.78rem; max-width: 480px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-              ${this.escapeHtml(m.snippet)}
-            </div>
-          </td>
-          <td style="font-size: 0.8rem; color: var(--text-muted);">${this.escapeHtml(m.date)}</td>
-          <td style="font-size: 0.8rem; color: var(--text-secondary);">${m.sizeEstimate ? Math.round(m.sizeEstimate / 1024) + ' KB' : '--'}</td>
-          <td class="text-right">
-            <button class="btn btn-sm btn-rose" onclick="app.trashSingleMessage('${m.id}')" title="Move to Trash">🗑️</button>
-          </td>
-        </tr>
-      `).join('');
-    } catch (e) {
-      this.filterTableBody.innerHTML = `<tr><td colspan="6" class="text-center text-rose">Search error: ${e.message}</td></tr>`;
-    }
-  }
-
-  toggleMessageSelect(id, checked) {
-    if (checked) {
-      this.state.selectedMessageIds.add(id);
+  function renderSearch() {
+    const s = state.search;
+    const body = $('search-body');
+    if (!s.items.length) {
+      body.innerHTML = `<tr><td colspan="6" class="empty-cell">No emails match <code>${esc(s.query)}</code>.</td></tr>`;
     } else {
-      this.state.selectedMessageIds.delete(id);
+      body.innerHTML = s.items.map((m) => `
+        <tr class="${m.unread ? 'is-unread' : ''}" data-id="${esc(m.id)}">
+          <td class="col-check"><input type="checkbox" class="row-check" value="${esc(m.id)}" ${s.selected.has(m.id) ? 'checked' : ''} aria-label="Select"></td>
+          <td class="col-sender">
+            <div class="sender-tag">${m.starred ? '<span class="star" title="Starred">★</span>' : ''}${esc(m.senderName)}</div>
+            <div class="sender-email-small">${esc(m.senderEmail)}</div>
+          </td>
+          <td class="col-subject">
+            <div class="subject-line">${esc(m.subject)}</div>
+            <div class="snippet-line">${esc(m.snippet)}</div>
+          </td>
+          <td class="hide-sm nowrap text-muted" title="${esc(m.date)}">${esc(fmtDate(m.timestamp))}</td>
+          <td class="hide-sm nowrap text-muted">${fmtSize(m.sizeEstimate)}</td>
+          <td class="text-right nowrap col-actions">
+            <a class="icon-btn" href="${esc(m.gmailUrl)}" target="_blank" rel="noopener" title="Open in Gmail">${ICON.open}</a>
+            ${m.unread ? `<button class="icon-btn" title="Mark read" data-action="row" data-op="read" data-id="${esc(m.id)}">${ICON.read}</button>` : ''}
+            ${m.labelIds.includes('INBOX') ? `<button class="icon-btn" title="Archive" data-action="row" data-op="archive" data-id="${esc(m.id)}">${ICON.archive}</button>` : ''}
+            ${m.labelIds.includes('TRASH') ? '' : `<button class="icon-btn danger" title="Move to Trash" data-action="row" data-op="trash" data-id="${esc(m.id)}">${ICON.trash}</button>`}
+          </td>
+        </tr>`).join('');
     }
-    this.updateSelectedCountUI();
+    $('load-more-row').hidden = !s.next;
+    updateSelection();
   }
 
-  toggleSelectAll(checkbox) {
-    const checks = document.querySelectorAll('.result-row-check');
-    checks.forEach(c => {
-      c.checked = checkbox.checked;
-      if (checkbox.checked) {
-        this.state.selectedMessageIds.add(c.value);
+  function updateSelection() {
+    const s = state.search;
+    const n = s.selected.size;
+    const shown = s.items.length;
+    $('results-count-label').textContent = n
+      ? `${plural(n, 'email')} selected`
+      : shown ? `Showing ${num(shown)}${s.next ? ` of ~${num(s.estimate)}` : ''}` : 'No results';
+    $('select-all').checked = shown > 0 && n === shown;
+    $('select-all').indeterminate = n > 0 && n < shown;
+    document.querySelectorAll('[data-action="bulk-selected"]').forEach((b) => { b.disabled = !n; });
+    $('btn-all-matching').disabled = !shown;
+  }
+
+  async function bulkSelected(op, btn) {
+    const ids = [...state.search.selected];
+    if (!ids.length) return;
+    setBusy(btn, true);
+    try {
+      await runOnIds(ids, op);
+      applyLocal(ids, op);
+      afterChange();
+    } catch (e) { fail('Action failed', e); } finally { setBusy(btn, false); }
+  }
+
+  async function rowAction(id, op, btn) {
+    setBusy(btn, true);
+    try {
+      await runOnIds([id], op);
+      applyLocal([id], op);
+      afterChange();
+    } catch (e) { fail('Action failed', e); setBusy(btn, false); }
+  }
+
+  /** Reflect an action in the loaded results without re-querying Gmail. */
+  function applyLocal(ids, op) {
+    const s = state.search;
+    const set = new Set(ids);
+    if (op === 'read') {
+      s.items.forEach((m) => { if (set.has(m.id)) { m.unread = false; m.labelIds = m.labelIds.filter((l) => l !== 'UNREAD'); } });
+    } else {
+      const q = s.query.toLowerCase();
+      const stillMatches = op === 'archive' && !/in:inbox|is:inbox/.test(q);
+      if (stillMatches) {
+        s.items.forEach((m) => { if (set.has(m.id)) m.labelIds = m.labelIds.filter((l) => l !== 'INBOX'); });
       } else {
-        this.state.selectedMessageIds.delete(c.value);
+        s.items = s.items.filter((m) => !set.has(m.id));
       }
+    }
+    ids.forEach((id) => s.selected.delete(id));
+    renderSearch();
+    // Keep the GitHub view in sync too.
+    const g = state.github.data;
+    if (g && op !== 'read') {
+      g.all = g.all.filter((m) => !set.has(m.id));
+      Object.keys(g.categorized).forEach((k) => { g.categorized[k] = g.categorized[k].filter((m) => !set.has(m.id)); });
+      renderGitHub();
+    }
+  }
+
+  // ----------------------------------------------------------------- github
+  async function loadGitHub() {
+    const feed = $('github-feed');
+    feed.innerHTML = `<div class="feed-empty-state"><span class="spinner"></span> Loading GitHub notifications…</div>`;
+    try {
+      state.github.data = await api('/api/github/triage?max_results=100');
+      renderGitHub();
+    } catch (e) {
+      feed.innerHTML = `<div class="feed-empty-state text-rose">${esc(e.message)}</div>`;
+    }
+  }
+
+  function ghItems() {
+    const g = state.github.data;
+    if (!g) return [];
+    return state.github.cat === 'all' ? g.all : (g.categorized[state.github.cat] || []);
+  }
+
+  function renderGitHub() {
+    const g = state.github.data;
+    if (!g) return;
+    document.querySelectorAll('.gh-tab-btn').forEach((b) => {
+      const cat = b.dataset.ghcat;
+      b.querySelector('span').textContent = cat === 'all' ? g.all.length : (g.categorized[cat] || []).length;
+      b.classList.toggle('active', cat === state.github.cat);
     });
-    this.updateSelectedCountUI();
-  }
-
-  updateSelectedCountUI() {
-    const count = this.state.selectedMessageIds.size;
-    this.resultsCountLabel.textContent = `${count} items selected`;
-  }
-
-  async trashSingleMessage(id) {
-    try {
-      await fetch('/api/batch/trash', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message_ids: [id] }),
-      });
-      this.showToast('Moved to Trash.', 'info');
-      this.executeFilterSearch();
-    } catch (e) {
-      this.showToast(`Error: ${e.message}`, 'danger');
-    }
-  }
-
-  async batchTrashSelected() {
-    const ids = Array.from(this.state.selectedMessageIds);
-    if (!ids.length) {
-      this.showToast('Please select one or more emails first.', 'warn');
+    const items = ghItems();
+    if (!items.length) {
+      $('github-feed').innerHTML = `<div class="feed-empty-state"><span class="big-check">✓</span>Nothing here — you're all caught up.</div>`;
       return;
     }
-
-    try {
-      const res = await fetch('/api/batch/trash', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message_ids: ids }),
-      });
-      const data = await res.json();
-      this.showToast(`Moved ${data.count} emails to Trash!`, 'success');
-      this.log(`Batch moved ${data.count} selected emails to Trash.`, 'success');
-      this.executeFilterSearch();
-      this.loadInboxStats();
-    } catch (e) {
-      this.showToast(`Error: ${e.message}`, 'danger');
-    }
+    $('github-feed').innerHTML = items.map((m) => {
+      const meta = m.githubMeta || {};
+      return `<div class="gh-item-card ${m.unread ? 'is-unread' : ''}">
+        <span class="gh-badge-tag badge-${esc(meta.category)}">${esc(meta.badge)}</span>
+        <div class="gh-content-col">
+          <a class="gh-subject" href="${esc(meta.url)}" target="_blank" rel="noopener">${esc(m.subject)}</a>
+          <div class="gh-snippet">${esc(m.snippet)}</div>
+          <div class="gh-meta-row">
+            <span>${esc(fmtDate(m.timestamp))}</span>
+            ${meta.repo ? `<span class="gh-repo">${esc(meta.repo)}</span>` : ''}
+            ${meta.reason ? `<span class="gh-reason">${esc(meta.reason.replace(/_/g, ' '))}</span>` : ''}
+          </div>
+        </div>
+        <div class="gh-actions-col">
+          <a class="icon-btn" href="${esc(meta.url)}" target="_blank" rel="noopener" title="Open on GitHub">${ICON.open}</a>
+          ${m.unread ? `<button class="icon-btn" title="Mark read" data-action="gh-row" data-op="read" data-id="${esc(m.id)}">${ICON.read}</button>` : ''}
+          <button class="icon-btn" title="Archive" data-action="gh-row" data-op="archive" data-id="${esc(m.id)}">${ICON.archive}</button>
+          <button class="icon-btn danger" title="Move to Trash" data-action="gh-row" data-op="trash" data-id="${esc(m.id)}">${ICON.trash}</button>
+        </div>
+      </div>`;
+    }).join('') + (g.more ? `<div class="feed-footnote">Showing the latest 100. Archive these to see older ones.</div>` : '');
   }
 
-  async batchMarkRead() {
-    const ids = Array.from(this.state.selectedMessageIds);
-    if (!ids.length) {
-      this.showToast('Please select one or more emails first.', 'warn');
-      return;
-    }
-
+  async function ghAction(ids, op, btn) {
+    if (!ids.length) return toast('Nothing to update in this view.', 'info');
+    setBusy(btn, true);
     try {
-      await fetch('/api/batch/labels', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message_ids: ids, remove_labels: ['UNREAD'] }),
-      });
-      this.showToast(`Marked ${ids.length} emails as read!`, 'success');
-      this.executeFilterSearch();
-    } catch (e) {
-      this.showToast(`Error: ${e.message}`, 'danger');
-    }
-  }
-
-  async batchArchive() {
-    const ids = Array.from(this.state.selectedMessageIds);
-    if (!ids.length) {
-      this.showToast('Please select one or more emails first.', 'warn');
-      return;
-    }
-
-    try {
-      await fetch('/api/batch/labels', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message_ids: ids, remove_labels: ['INBOX'] }),
-      });
-      this.showToast(`Archived ${ids.length} emails!`, 'success');
-      this.executeFilterSearch();
-    } catch (e) {
-      this.showToast(`Error: ${e.message}`, 'danger');
-    }
-  }
-
-  // --- GOOGLE OAUTH SETUP & UPLOAD ---
-  async uploadCredentialsFile(file) {
-    const formData = new FormData();
-    formData.append('file', file);
-
-    this.log(`Uploading OAuth credentials file (${file.name})...`, 'info');
-    try {
-      const res = await fetch('/api/auth/upload-credentials', {
-        method: 'POST',
-        body: formData,
-      });
-      const data = await res.json();
-      if (data.success) {
-        this.showToast('credentials.json saved successfully! Click Authorize to connect.', 'success');
-        this.log('credentials.json uploaded successfully.', 'success');
-        this.checkAuthStatus();
+      await runOnIds(ids, op);
+      const set = new Set(ids);
+      const g = state.github.data;
+      if (op === 'read') {
+        g.all.forEach((m) => { if (set.has(m.id)) m.unread = false; });
       } else {
-        this.showToast(`Error: ${data.detail || 'Upload failed'}`, 'danger');
+        g.all = g.all.filter((m) => !set.has(m.id));
+        Object.keys(g.categorized).forEach((k) => { g.categorized[k] = g.categorized[k].filter((m) => !set.has(m.id)); });
       }
-    } catch (e) {
-      this.showToast(`Error uploading: ${e.message}`, 'danger');
-    }
+      renderGitHub();
+      afterChange();
+    } catch (e) { fail('Action failed', e); } finally { setBusy(btn, false); }
   }
 
-  async launchOAuthLogin() {
-    this.log('Fetching Google OAuth authorization URL...', 'info');
-    this.showToast('Preparing Google sign-in...', 'info');
-
+  // ------------------------------------------------------------- auto-clean
+  async function loadAutoClean(force) {
     try {
-      const res = await fetch('/api/auth/url');
-      const data = await res.json();
-      if (!data.success || !data.auth_url) {
-        throw new Error(data.detail || 'Failed to generate auth URL');
-      }
-
-      this.log('Opening official Google Account authorization screen...', 'info');
-      
-      // Listen for callback postMessage
-      window.addEventListener('message', (event) => {
-        if (event.data === 'oauth_complete') {
-          this.log('OAuth authorization confirmed by callback!', 'success');
-          this.showToast('Google Account authorized successfully!', 'success');
-          this.checkAuthStatus();
-        }
-      }, { once: true });
-
-      // Open Google sign in in popup window or tab
-      const authWindow = window.open(
-        data.auth_url,
-        'GoogleAuthPopup',
-        'width=600,height=720,menubar=no,toolbar=no,location=no,status=no'
-      );
-
-      if (!authWindow || authWindow.closed || typeof authWindow.closed === 'undefined') {
-        // If popup was blocked by browser, redirect current tab
-        this.showToast('Redirecting to Google sign-in...', 'info');
-        window.location.href = data.auth_url;
-      } else {
-        // Poll status in background until connected
-        let pollCount = 0;
-        const interval = setInterval(async () => {
-          pollCount++;
-          if (pollCount > 60) {
-            clearInterval(interval);
-            return;
-          }
-          try {
-            const statusRes = await fetch('/api/auth/status');
-            const statusData = await statusRes.json();
-            if (statusData.authenticated) {
-              clearInterval(interval);
-              this.log(`Authentication verified for ${statusData.profile?.email}`, 'success');
-              this.showToast('Connected to Google Account!', 'success');
-              this.checkAuthStatus();
-            }
-          } catch (e) {}
-        }, 2000);
-      }
-    } catch (e) {
-      this.showToast(`Login failed: ${e.message}`, 'danger');
-      this.log(`OAuth URL error: ${e.message}`, 'danger');
-    }
+      if (force || !state.ac) state.ac = await api('/api/sync/config');
+      renderAutoClean();
+      loadHistory();
+      pollSyncStatus();
+    } catch (e) { fail('Could not load Auto-Clean settings', e); }
   }
 
-  async logoutAccount() {
-    if (!confirm('Are you sure you want to disconnect your Google Account and clear saved tokens?')) return;
+  function renderAutoClean() {
+    const c = state.ac;
+    $('ac-enabled').checked = c.enabled;
+    $('ac-interval').value = c.interval_minutes;
+    $('ac-max').value = c.max_per_rule;
+    $('badge-auto').hidden = !c.enabled;
+    $('rules-body').innerHTML = c.rules.length ? c.rules.map((r, i) => `
+      <tr data-index="${i}">
+        <td class="col-check"><input type="checkbox" data-field="enabled" ${r.enabled ? 'checked' : ''} aria-label="Enabled"></td>
+        <td><input class="cell-input" data-field="name" value="${esc(r.name)}" placeholder="Rule name"></td>
+        <td><input class="cell-input mono" data-field="query" value="${esc(r.query)}" placeholder="e.g. from:news@shop.com"></td>
+        <td>
+          <select class="cell-input" data-field="action">
+            ${['trash', 'archive', 'read'].map((a) => `<option value="${a}" ${r.action === a ? 'selected' : ''}>${esc(ACTION_WORDS[a].verb)}</option>`).join('')}
+          </select>
+        </td>
+        <td class="text-right nowrap">
+          <button class="icon-btn" title="Preview matches" data-action="ac-preview" data-index="${i}">${ICON.search}</button>
+          <button class="icon-btn danger" title="Delete rule" data-action="ac-remove" data-index="${i}">${ICON.trash}</button>
+        </td>
+      </tr>`).join('') : `<tr><td colspan="5" class="empty-cell">No rules yet — add one.</td></tr>`;
+  }
+
+  function readAutoCleanForm() {
+    const c = state.ac;
+    c.enabled = $('ac-enabled').checked;
+    c.interval_minutes = Number($('ac-interval').value);
+    c.max_per_rule = Number($('ac-max').value);
+    document.querySelectorAll('#rules-body tr[data-index]').forEach((tr) => {
+      const r = c.rules[Number(tr.dataset.index)];
+      tr.querySelectorAll('[data-field]').forEach((f) => {
+        r[f.dataset.field] = f.type === 'checkbox' ? f.checked : f.value.trim();
+      });
+    });
+    return c;
+  }
+
+  async function saveAutoClean(btn) {
+    setBusy(btn, true);
     try {
-      await fetch('/api/auth/logout', { method: 'POST' });
-      this.showToast('Logged out successfully.', 'info');
-      this.log('Logged out of Google Account.', 'warn');
-      this.checkAuthStatus();
-    } catch (e) {
-      this.showToast(`Error: ${e.message}`, 'danger');
+      const res = await api('/api/sync/config', { method: 'POST', body: readAutoCleanForm() });
+      state.ac = res.config;
+      renderAutoClean();
+      toast('Auto-Clean settings saved.', 'success');
+      log('Auto-Clean settings saved.', 'success');
+    } catch (e) { fail('Could not save', e); } finally { setBusy(btn, false); }
+  }
+
+  async function loadHistory() {
+    try {
+      const rows = await api('/api/sync/history');
+      $('history-body').innerHTML = rows.length ? rows.slice(0, 30).map((h) => {
+        const details = Object.entries(h.details || {}).filter(([, n]) => n).map(([k, n]) => `${k}: ${n}`);
+        const errs = Object.entries(h.errors || {}).map(([k, v]) => `${k}: ${v}`);
+        return `<tr>
+          <td class="nowrap">${esc(h.timestamp)}</td>
+          <td><b>${num(h.totalCleaned)}</b></td>
+          <td class="hide-sm">${esc(h.durationSeconds)}s</td>
+          <td class="hide-sm">${num(h.inboxMessagesRemaining)}</td>
+          <td class="details-cell">${details.length ? esc(details.join(' · ')) : '<span class="text-muted">Nothing to clean</span>'}
+            ${errs.length ? `<div class="text-rose">${esc(errs.join(' · '))}</div>` : ''}</td>
+        </tr>`;
+      }).join('') : `<tr><td colspan="5" class="empty-cell">No runs yet.</td></tr>`;
+    } catch (e) { /* history is optional */ }
+  }
+
+  let statusTimer = null;
+  async function pollSyncStatus() {
+    clearTimeout(statusTimer);
+    try {
+      const st = await api('/api/sync/status');
+      const el = $('ac-status');
+      el.textContent = st.running ? `Running since ${st.startedAt}…` : 'Idle';
+      el.classList.toggle('running', st.running);
+      setBusy(document.querySelector('[data-action="ac-run"]'), st.running);
+      if (st.running) {
+        statusTimer = setTimeout(pollSyncStatus, 2000);
+      } else if (state.acWasRunning) {
+        state.acWasRunning = false;
+        loadHistory();
+        afterChange();
+        toast('Auto-Clean run finished — see History.', 'success');
+      }
+      state.acWasRunning = st.running || false;
+    } catch (_) { /* ignore */ }
+  }
+
+  async function runAutoCleanNow(btn) {
+    if (!confirm('Run all enabled rules now? Matching emails will be processed immediately.')) return;
+    setBusy(btn, true);
+    try {
+      await api('/api/sync/run-now', { method: 'POST' });
+      log('Auto-Clean run started.', 'info');
+      state.acWasRunning = true;
+      pollSyncStatus();
+    } catch (e) { fail('Could not start', e); setBusy(btn, false); }
+  }
+
+  // ------------------------------------------------------------ click hub
+  const handlers = {
+    'tab': (el) => switchTab(el.dataset.tab),
+    'go-setup': () => switchTab('setup'),
+    'search': (el) => runSearch(el.dataset.query),
+    'preview': (el) => openPreview(el.dataset.query, el.dataset.title),
+    'reload-senders': () => loadSenders(),
+    'unsubscribe': (el) => unsubscribe(el.dataset.id, el.dataset.name),
+    'bulk-selected': (el) => bulkSelected(el.dataset.op, el),
+    'all-matching': () => openPreview(state.search.query, 'All matching emails'),
+    'load-more': (el) => { setBusy(el, true); runSearch(state.search.query, { append: true }).finally(() => setBusy(el, false)); },
+    'row': (el) => rowAction(el.dataset.id, el.dataset.op, el),
+    'gh-refresh': () => loadGitHub(),
+    'gh-row': (el) => ghAction([el.dataset.id], el.dataset.op, el),
+    'gh-bulk': (el) => {
+      const items = ghItems().filter((m) => el.dataset.op !== 'read' || m.unread);
+      if (el.dataset.op === 'archive' && items.length && !confirm(`Archive ${plural(items.length, 'notification')} shown?`)) return;
+      ghAction(items.map((m) => m.id), el.dataset.op, el);
+    },
+    'ac-run': (el) => runAutoCleanNow(el),
+    'ac-save': (el) => saveAutoClean(el),
+    'ac-history': () => loadHistory(),
+    'ac-add': () => {
+      readAutoCleanForm();
+      state.ac.rules.push({ name: '', query: '', action: 'trash', enabled: true });
+      renderAutoClean();
+      const inputs = document.querySelectorAll('#rules-body [data-field="name"]');
+      inputs[inputs.length - 1]?.focus();
+    },
+    'ac-remove': (el) => {
+      readAutoCleanForm();
+      state.ac.rules.splice(Number(el.dataset.index), 1);
+      renderAutoClean();
+      toast('Rule removed — click Save changes to keep it that way.', 'info');
+    },
+    'ac-preview': (el) => {
+      readAutoCleanForm();
+      const r = state.ac.rules[Number(el.dataset.index)];
+      if (!r.query) return toast('Enter a Gmail search for this rule first.', 'warn');
+      openPreview(r.query, r.name || 'Rule preview', r.action);
+    },
+    'copy-redirect': (el) => {
+      navigator.clipboard?.writeText(el.textContent).then(() => toast('Redirect URI copied.', 'success'));
+    },
+    'connect': () => connect(),
+    'logout': () => logout(),
+    'toggle-log': () => $('log-drawer').classList.toggle('collapsed'),
+    'close-modal': () => closeModal(),
+    'confirm-modal': () => confirmModal(),
+  };
+
+  document.addEventListener('click', (e) => {
+    const el = e.target.closest('[data-action]');
+    if (!el || el.disabled) return;
+    const fn = handlers[el.dataset.action];
+    if (fn) { e.preventDefault(); fn(el, e); }
+  });
+
+  // ------------------------------------------------------------ other events
+  document.querySelectorAll('.nav-item').forEach((b) => b.addEventListener('click', () => switchTab(b.dataset.tab)));
+  document.querySelectorAll('.gh-tab-btn').forEach((b) => b.addEventListener('click', () => {
+    state.github.cat = b.dataset.ghcat;
+    renderGitHub();
+  }));
+
+  $('btn-refresh').addEventListener('click', () => {
+    state.loaded = {};
+    if (state.auth?.authenticated && state.tab !== 'overview') loadStats();
+    refreshCurrent(true);
+  });
+
+  $('quick-search-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const q = $('quick-search-input').value.trim();
+    if (q) runSearch(q);
+  });
+
+  $('search-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    runSearch($('search-input').value);
+  });
+
+  $('search-body').addEventListener('change', (e) => {
+    if (!e.target.classList.contains('row-check')) return;
+    const s = state.search.selected;
+    e.target.checked ? s.add(e.target.value) : s.delete(e.target.value);
+    updateSelection();
+  });
+
+  $('select-all').addEventListener('change', (e) => {
+    const s = state.search.selected;
+    state.search.items.forEach((m) => (e.target.checked ? s.add(m.id) : s.delete(m.id)));
+    document.querySelectorAll('.row-check').forEach((c) => { c.checked = e.target.checked; });
+    updateSelection();
+  });
+
+  $('modal-action').addEventListener('change', updateModalNote);
+  $('preview-modal').addEventListener('click', (e) => { if (e.target.id === 'preview-modal') closeModal(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && state.modal) closeModal();
+    if (e.key === '/' && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) {
+      e.preventDefault();
+      $('quick-search-input').focus();
     }
-  }
+  });
 
-  // --- UTILITIES ---
-  escapeHtml(str) {
-    if (!str) return '';
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
-  }
-}
+  const dz = $('dropzone');
+  const fileInput = $('credentials-input');
+  dz.addEventListener('click', () => fileInput.click());
+  dz.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') fileInput.click(); });
+  dz.addEventListener('dragover', (e) => { e.preventDefault(); dz.classList.add('dragging'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('dragging'));
+  dz.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dz.classList.remove('dragging');
+    uploadCredentials(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', () => { uploadCredentials(fileInput.files[0]); fileInput.value = ''; });
 
-// Global App Instance
-let app;
-document.addEventListener('DOMContentLoaded', () => {
-  app = new GmailZenithApp();
-});
+  // ------------------------------------------------------------------ start
+  log('Gmail Zenith ready.');
+  let initialTab = 'overview';
+  try { initialTab = localStorage.getItem('zenith.tab') || 'overview'; } catch (_) { /* storage unavailable */ }
+  switchTab(TAB_TITLES[initialTab] ? initialTab : 'overview');
+  checkAuth().then(() => {
+    if (state.auth && !state.auth.authenticated && !state.auth.hasCredentials) switchTab('setup');
+  });
+})();
